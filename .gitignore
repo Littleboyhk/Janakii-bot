@@ -1,0 +1,27 @@
+# Sensitive credentials & environment variables
+.env
+*.env
+*.session
+*.session-journal
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv/
+
+# Antigravity IDE / Gemini internal artifacts
+.gemini/
+.agents/
+
+# Operating system files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store

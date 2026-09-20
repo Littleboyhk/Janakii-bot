@@ -1,0 +1,12 @@
+# Core Telegram Bot Framework with JobQueue support (APScheduler)
+python-telegram-bot[job-queue]>=20.7
+
+# Async MongoDB Driver
+motor>=3.3.2
+pymongo>=4.6.1
+
+# Fast Async HTTP Client for Metadata
+httpx>=0.25.0
+
+# Environment Variables Management
+python-dotenv>=1.0.1
