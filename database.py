@@ -199,7 +199,9 @@ async def insert_movie(
     file_size: str = "",
     season_episode: Optional[str] = None,
     channel_id: Optional[Union[int, str]] = None,
-    message_id: Optional[int] = None
+    message_id: Optional[int] = None,
+    year: Optional[int] = None,
+    language: Optional[str] = None
 ) -> ObjectId:
     """
     Insert a movie/series document into MongoDB.
@@ -212,6 +214,8 @@ async def insert_movie(
       file_id: String
       channel_id: Optional int/str
       message_id: Optional int
+      year: Optional int
+      language: Optional str
     """
     col = get_movies_collection()
     doc = {
@@ -221,7 +225,9 @@ async def insert_movie(
         "file_size": file_size.strip(),
         "file_id": file_id.strip() if file_id else "",
         "channel_id": channel_id,
-        "message_id": message_id
+        "message_id": message_id,
+        "year": year,
+        "language": language.strip() if language else None
     }
     result = await col.insert_one(doc)
     _db_search_cache.clear()

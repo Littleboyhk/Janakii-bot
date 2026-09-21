@@ -44,6 +44,7 @@ from telethon.tl.types import (
 
 import config
 import database
+import ai_parser
 
 logging.basicConfig(
     format="%(asctime)s - [%(levelname)s] - %(name)s - %(message)s",
@@ -119,7 +120,7 @@ def parse_media_metadata(raw_text: str) -> Dict[str, Optional[str]]:
     }
 
 
-async def index_channel(limit: Optional[int] = None, use_bot_token: bool = False):
+async def index_channel(limit: Optional[int] = None, use_bot_token: bool = False, sync_mode: bool = False, use_ai: bool = True):
     """Crawl the Telegram channel and index documents into MongoDB."""
     api_id = config.TELEGRAM_API_ID
     api_hash = config.TELEGRAM_API_HASH
@@ -133,11 +134,13 @@ async def index_channel(limit: Optional[int] = None, use_bot_token: bool = False
         print("❌ TARGET_CHANNEL is not specified in .env! (e.g., https://t.me/+FhBcSz2mNEIwOGE1)")
         return
 
+    ai_status = "Enabled (Google Gemini)" if (use_ai and config.ENABLE_AI_INGESTION and config.GEMINI_API_KEY) else "Disabled (Regex Heuristics)"
     print("=" * 65)
     print("🚀 Starting Automated Telegram Channel Indexer")
     print(f"• Target Channel: {target}")
     print(f"• Limit:          {limit if limit else 'ALL Files'}")
     print(f"• Mode:           {'Bot Token' if use_bot_token else 'User Session'}")
+    print(f"• AI Parsing:     {ai_status}")
     print("=" * 65)
 
     # Initialize MongoDB
@@ -183,8 +186,8 @@ async def index_channel(limit: Optional[int] = None, use_bot_token: bool = False
     print(f"📢 Target Channel Selected: {channel_title} (ID: {channel_id})")
 
     count = 0
-    batch: List[Dict[str, Any]] = []
-    BATCH_SIZE = 100
+    raw_items_buffer: List[Dict[str, Any]] = []
+    BATCH_SIZE = 15 if use_ai else 100
 
     min_id = None
     if sync_mode:
@@ -195,10 +198,54 @@ async def index_channel(limit: Optional[int] = None, use_bot_token: bool = False
         else:
             print("ℹ️ No previous messages recorded. Running standard crawl...")
 
+    async def flush_buffer():
+        nonlocal raw_items_buffer, count
+        if not raw_items_buffer:
+            return
+
+        db_batch = []
+        if use_ai and config.ENABLE_AI_INGESTION:
+            parsed_list = await ai_parser.parse_media_metadata_ai_batch(
+                [{"id": it["msg_id"], "raw_text": it["raw_title"], "caption": it["caption"]} for it in raw_items_buffer],
+                chunk_size=15
+            )
+            parsed_map = {p.get("item_id"): p for p in parsed_list if p}
+            for it in raw_items_buffer:
+                p = parsed_map.get(it["msg_id"]) or parse_media_metadata(it["raw_title"])
+                db_batch.append({
+                    "title": p["title"],
+                    "season_episode": p.get("season_episode"),
+                    "quality": p.get("quality") or "HD",
+                    "file_size": it["formatted_size"],
+                    "file_id": "",
+                    "channel_id": channel_id,
+                    "message_id": it["msg_id"],
+                    "year": p.get("year"),
+                    "language": p.get("language")
+                })
+        else:
+            for it in raw_items_buffer:
+                p = parse_media_metadata(it["raw_title"])
+                db_batch.append({
+                    "title": p["title"],
+                    "season_episode": p.get("season_episode"),
+                    "quality": p.get("quality") or "HD",
+                    "file_size": it["formatted_size"],
+                    "file_id": "",
+                    "channel_id": channel_id,
+                    "message_id": it["msg_id"]
+                })
+
+        await database.insert_movies_bulk(db_batch)
+        count += len(db_batch)
+        sample = db_batch[-1]
+        tag = "🤖 AI" if (use_ai and config.ENABLE_AI_INGESTION and config.GEMINI_API_KEY) else "⚡ Regex"
+        print(f"  [{tag}] Indexed {count:,} files... (Latest: {sample['title']})")
+        raw_items_buffer = []
+
     print("\n🔍 Crawling media messages and indexing to MongoDB Atlas...")
 
     async for msg in client.iter_messages(channel, limit=limit, min_id=min_id):
-        # Only process messages that contain video or document media
         if not msg.media or not (hasattr(msg.media, "document") or hasattr(msg, "video")):
             continue
 
@@ -209,7 +256,6 @@ async def index_channel(limit: Optional[int] = None, use_bot_token: bool = False
         file_size_raw = getattr(doc, "size", 0)
         formatted_size = format_bytes(file_size_raw)
 
-        # Get filename
         file_name = None
         if hasattr(doc, "attributes"):
             for attr in doc.attributes:
@@ -218,29 +264,18 @@ async def index_channel(limit: Optional[int] = None, use_bot_token: bool = False
                     break
 
         raw_title = file_name or msg.message or getattr(channel, "title", "Movie")
-        parsed = parse_media_metadata(raw_title)
+        raw_items_buffer.append({
+            "msg_id": msg.id,
+            "raw_title": raw_title,
+            "caption": msg.message or "",
+            "formatted_size": formatted_size
+        })
 
-        record = {
-            "title": parsed["title"],
-            "season_episode": parsed["season_episode"],
-            "quality": parsed["quality"],
-            "file_size": formatted_size,
-            "file_id": "", # Served directly via copy_message
-            "channel_id": channel_id,
-            "message_id": msg.id
-        }
-        batch.append(record)
-        count += 1
+        if len(raw_items_buffer) >= BATCH_SIZE:
+            await flush_buffer()
 
-        if len(batch) >= BATCH_SIZE:
-            await database.insert_movies_bulk(batch)
-            print(f"  ⚡ Indexed {count:,} files so far... (Latest: {record['title']})")
-            batch = []
-
-    # Insert remaining documents
-    if batch:
-        await database.insert_movies_bulk(batch)
-        print(f"  ⚡ Indexed {count:,} files (Final Batch)")
+    # Flush any remaining items in buffer
+    await flush_buffer()
 
     print("\n" + "=" * 65)
     print(f"🎉 Channel Indexing Complete!")
@@ -258,9 +293,10 @@ def main():
     parser.add_argument("--limit", type=int, default=None, help="Maximum number of messages to process")
     parser.add_argument("--bot", action="store_true", help="Log in using bot token instead of user phone account")
     parser.add_argument("--sync", action="store_true", help="Incremental sync: only index new files uploaded today since last run")
+    parser.add_argument("--no-ai", action="store_true", help="Disable AI metadata parsing and use fast regex heuristics")
     args = parser.parse_args()
 
-    asyncio.run(index_channel(limit=args.limit, use_bot_token=args.bot, sync_mode=args.sync))
+    asyncio.run(index_channel(limit=args.limit, use_bot_token=args.bot, sync_mode=args.sync, use_ai=not args.no_ai))
 
 
 if __name__ == "__main__":

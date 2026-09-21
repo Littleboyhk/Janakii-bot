@@ -17,7 +17,8 @@ The bot serves as an automated media librarian: it does not store media files on
 - 📢 **Force-Subscribe Gatekeeper**: Checks if users are members of your updates channel before allowing searches or file downloads.
 - ⏳ **Anti-Spam Rate Limiting**: Enforces a 3-second cooldown between user queries to protect the Telegram API.
 - 🔒 **PM-Only Restriction**: Automatically rejects or ignores group chat attempts.
-- 🛠 **Media Ingestion Tools**: Includes interactive CLI, sample data seeder, and live Telegram File ID forward listener (`add_movie.py`).
+- 🤖 **Intelligent Channel Ingestion & Filename Parsing**: Powered by Google Gemini AI to strip watermarks, group handles, and noisy release tags, extracting canonical titles, release years, quality, and audio language. Includes zero-downtime heuristic fallback.
+- 🛠 **Media Ingestion Tools**: Includes interactive CLI, sample data seeder, automated channel crawler (`index_channel.py`), and live Telegram File ID forward listener (`add_movie.py`).
 
 ---
 
@@ -33,6 +34,8 @@ The bot operates on a MongoDB collection named `movies` with the following docum
 | `quality` | `String` | Resolution & video encoding info | `"1080p JHS DUA"` |
 | `file_size` | `String` | Formatted file size | `"890.19 MB"` |
 | `file_id` | `String` | Telegram File ID of the stored media | `"BQACAgUAAxkBAAI..."` |
+| `year` | `Integer` (or `null`) | Release year (optional AI-enriched) | `2023` |
+| `language` | `String` (or `null`) | Audio language (optional AI-enriched) | `"Dual Audio"` |
 
 ---
 
@@ -43,9 +46,12 @@ The bot operates on a MongoDB collection named `movies` with the following docum
 ├── requirements.txt   # Python package dependencies
 ├── config.py          # Centralized configuration & env validation
 ├── database.py        # Motor async MongoDB client, indexes & search queries
+├── ai_parser.py       # Google Gemini AI intelligent filename parsing engine
 ├── bot.py             # Main bot application, handlers, and JobQueue callbacks
+├── index_channel.py   # Bulk channel crawling & batch indexing with AI support
 ├── add_movie.py       # Helper utility: CLI, sample data seeder, and File ID listener
-├── test_bot.py        # Automated test suite (6 tests)
+├── test_bot.py        # Core automated test suite
+├── test_ai_parser.py  # AI parser unit & fallback test suite
 └── README.md          # Complete documentation & operational guide
 ```
 

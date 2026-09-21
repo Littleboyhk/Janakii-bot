@@ -60,6 +60,11 @@ TELEGRAM_API_ID: int = _parse_int(os.getenv("TELEGRAM_API_ID"), 0)
 TELEGRAM_API_HASH: str = os.getenv("TELEGRAM_API_HASH", "").strip()
 TARGET_CHANNEL: str = os.getenv("TARGET_CHANNEL", "").strip()
 
+# AI Ingestion Settings (Google Gemini)
+GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "").strip()
+ENABLE_AI_INGESTION: bool = os.getenv("ENABLE_AI_INGESTION", "true").lower() in ("true", "1", "yes")
+GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+
 
 def validate_config() -> None:
     """Validate that mandatory configuration settings are present."""

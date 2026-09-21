@@ -33,6 +33,7 @@ if hasattr(sys.stderr, "reconfigure"):
 
 import config
 import database
+import ai_parser
 
 logging.basicConfig(
     format="%(asctime)s - [%(levelname)s] - %(name)s - %(message)s",
@@ -60,14 +61,45 @@ async def insert_movie_cli():
     print("🎬 Add New Movie / Series to Database")
     print("=" * 50)
 
-    title = input("Enter Title (e.g., Ultimate Spider-Man): ").strip()
-    if not title:
+    raw_input = input("Enter Title or raw filename (e.g., [TG] Oppen.2023.1080p.mkv): ").strip()
+    if not raw_input:
         print("❌ Title cannot be empty.")
         await database.close_db()
         return
 
-    season_episode = input("Enter Season/Episode (e.g., S01E21 or press Enter for Movies): ").strip() or None
-    quality = input("Enter Quality (e.g., 1080p JHS DUA): ").strip() or "1080p"
+    # Intelligently parse raw title with AI
+    parsed = await ai_parser.parse_media_metadata_ai(raw_input)
+    default_title = parsed.get("title") or raw_input
+    default_quality = parsed.get("quality") or "1080p"
+    default_se = parsed.get("season_episode")
+    default_year = parsed.get("year")
+    default_lang = parsed.get("language")
+
+    if parsed.get("is_ai"):
+        print(f"\n🤖 AI Detected:")
+        print(f"  • Title:   {default_title}")
+        print(f"  • Quality: {default_quality}")
+        if default_se:
+            print(f"  • S/E:     {default_se}")
+        if default_year:
+            print(f"  • Year:    {default_year}")
+        if default_lang:
+            print(f"  • Lang:    {default_lang}")
+
+        choice = input("\nUse AI detected metadata? [Y/n]: ").strip().lower()
+        if choice in ("n", "no"):
+            title = input(f"Enter Title [{default_title}]: ").strip() or default_title
+            season_episode = input(f"Enter Season/Episode [{default_se or 'None'}]: ").strip() or default_se
+            quality = input(f"Enter Quality [{default_quality}]: ").strip() or default_quality
+        else:
+            title = default_title
+            season_episode = default_se
+            quality = default_quality
+    else:
+        title = input(f"Enter Title [{default_title}]: ").strip() or default_title
+        season_episode = input(f"Enter Season/Episode (e.g. S01E21 or Enter for Movies): ").strip() or default_se
+        quality = input(f"Enter Quality [{default_quality}]: ").strip() or default_quality
+
     file_size = input("Enter File Size (e.g., 890.19 MB): ").strip() or "Unknown"
     file_id = input("Enter Telegram File ID: ").strip()
 
@@ -81,7 +113,9 @@ async def insert_movie_cli():
         file_id=file_id,
         quality=quality,
         file_size=file_size,
-        season_episode=season_episode
+        season_episode=season_episode,
+        year=default_year,
+        language=default_lang
     )
 
     print("\n✅ Successfully added movie to database!")
@@ -241,27 +275,50 @@ def run_telegram_listener():
         file_size_raw = getattr(media, "file_size", 0)
         formatted_size = format_bytes(file_size_raw)
 
-        # Clean file extension if present in title
-        clean_title = file_name
-        for ext in [".mp4", ".mkv", ".avi", ".mov", ".webm", ".ts"]:
-            if clean_title.lower().endswith(ext):
-                clean_title = clean_title[:-len(ext)]
-                break
+        # Intelligently parse metadata using Google Gemini AI (with heuristic fallback)
+        parsed = await ai_parser.parse_media_metadata_ai(file_name, caption=msg.caption)
+        clean_title = parsed["title"]
+        quality = parsed["quality"]
+        season_episode = parsed.get("season_episode")
+        year = parsed.get("year")
+        language = parsed.get("language")
+        is_ai = parsed.get("is_ai")
+
+        mode_str = "🤖 AI Extracted" if is_ai else "⚡ Heuristic Extracted"
 
         print("\n" + "*" * 40)
-        print("🎯 New Media Received:")
-        print(f"  • File Name: {file_name}")
-        print(f"  • File Size: {formatted_size}")
-        print(f"  • File ID:   {file_id}")
+        print(f"🎯 New Media Received ({mode_str}):")
+        print(f"  • Raw Name:       {file_name}")
+        print(f"  • Clean Title:    {clean_title}")
+        if year:
+            print(f"  • Year:           {year}")
+        if season_episode:
+            print(f"  • Season/Episode: {season_episode}")
+        print(f"  • Quality:        {quality}")
+        if language:
+            print(f"  • Language:       {language}")
+        print(f"  • File Size:      {formatted_size}")
+        print(f"  • File ID:        {file_id}")
         print("*" * 40 + "\n")
 
-        # Reply with copy-pasteable info
+        # Reply with structured preview
+        details = [
+            f"🎬 **Clean Title:** `{clean_title}`",
+            f"💿 **Quality:** `{quality}`",
+            f"💾 **File Size:** `{formatted_size}`",
+        ]
+        if year:
+            details.append(f"📅 **Year:** `{year}`")
+        if season_episode:
+            details.append(f"📺 **Season/Episode:** `{season_episode}`")
+        if language:
+            details.append(f"🗣 **Language:** `{language}`")
+        details.append(f"🔑 **File ID:**\n`{file_id}`")
+
         reply_text = (
-            "✅ **Media Received!**\n\n"
-            f"📁 **File Name:** `{file_name}`\n"
-            f"💾 **File Size:** `{formatted_size}`\n"
-            f"🔑 **File ID:**\n`{file_id}`\n\n"
-            "💡 *Tip: You can insert this into MongoDB using `python add_movie.py` or use the auto-ingest flag.*"
+            f"✅ **Media Received!** ({mode_str})\n\n"
+            + "\n".join(details) + "\n\n"
+            "💡 *Tip: Auto-indexer directly saves this into MongoDB Atlas!*"
         )
         await msg.reply_text(reply_text, parse_mode=ParseMode.MARKDOWN)
 

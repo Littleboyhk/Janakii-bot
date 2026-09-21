@@ -36,6 +36,7 @@ from telegram.ext import (
 import config
 import database
 import metadata
+import ai_parser
 
 # Configure structured logging
 logging.basicConfig(
@@ -1129,7 +1130,7 @@ async def handle_channel_forward(update: Update, context: ContextTypes.DEFAULT_T
 async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Live Real-Time Ingester:
-    Automatically indexes new videos and documents as they are uploaded to the channel!
+    Automatically indexes new videos and documents as they are uploaded to the channel with AI parsing!
     """
     msg = update.channel_post
     if not msg:
@@ -1143,7 +1144,8 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     file_size_raw = getattr(media, "file_size", 0)
     formatted_size = database.format_bytes(file_size_raw)
 
-    parsed = database.parse_media_metadata(file_name)
+    # Intelligently parse metadata using Google Gemini AI (with heuristic fallback)
+    parsed = await ai_parser.parse_media_metadata_ai(file_name, caption=msg.caption)
     channel_id = msg.chat.id
     message_id = msg.message_id
     file_id = media.file_id
@@ -1153,11 +1155,24 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         file_id=file_id,
         quality=parsed["quality"],
         file_size=formatted_size,
-        season_episode=parsed["season_episode"],
+        season_episode=parsed.get("season_episode"),
         channel_id=channel_id,
-        message_id=message_id
+        message_id=message_id,
+        year=parsed.get("year"),
+        language=parsed.get("language")
     )
-    logger.info("✨ Auto-indexed new daily upload: '%s' [%s] (MsgID: %s)", parsed["title"], formatted_size, message_id)
+    mode_tag = "🤖 AI" if parsed.get("is_ai") else "⚡ Heuristic"
+    logger.info(
+        "✨ [%s Ingest] Upload indexed: '%s' (Year: %s | Quality: %s | SE: %s | Lang: %s) [%s] (MsgID: %s)",
+        mode_tag,
+        parsed["title"],
+        parsed.get("year"),
+        parsed["quality"],
+        parsed.get("season_episode"),
+        parsed.get("language"),
+        formatted_size,
+        message_id
+    )
 
 
 async def noop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
