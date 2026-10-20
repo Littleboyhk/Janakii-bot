@@ -16,7 +16,9 @@ The bot serves as an automated media librarian: it does not store media files on
 - 💣 **Auto-Delete (Ban Prevention)**: Uses `JobQueue` (APScheduler) to automatically delete both the sent media file message **and** the user's original search message after **300 seconds (5 minutes)** with a self-destruct warning caption.
 - 📢 **Force-Subscribe Gatekeeper**: Checks if users are members of your updates channel before allowing searches or file downloads.
 - ⏳ **Anti-Spam Rate Limiting**: Enforces a 3-second cooldown between user queries to protect the Telegram API.
-- 🔒 **PM-Only Restriction**: Automatically rejects or ignores group chat attempts.
+- 👥 **Group Chat & Deep-Linking Support**: Full support for Telegram groups (`/search`, inline quality/season filters, and deep-link file downloads) with group `/start` command intro guide.
+- 🍿 **YouTube Trailer Streaming & IMDb Ratings**: Instant 1-click official YouTube trailer preview button and rich IMDb ratings, runtime, genres, and cast details directly in the Netflix-style card.
+- 📁 **Smart TV Series Season Browser & 1-Click Batch Delivery**: Automatically detects TV show seasons, providing folder filters (`[📁 S1]`, `[📁 S2]`, etc.) and a 1-click batch download button to deliver an entire season sequentially in natural episode order.
 - 🤖 **Intelligent Channel Ingestion & Filename Parsing**: Powered by Google Gemini AI to strip watermarks, group handles, and noisy release tags, extracting canonical titles, release years, quality, and audio language. Includes zero-downtime heuristic fallback.
 - 🛠 **Media Ingestion Tools**: Includes interactive CLI, sample data seeder, automated channel crawler (`index_channel.py`), and live Telegram File ID forward listener (`add_movie.py`).
 
@@ -225,6 +227,5 @@ OK
 2. **Rate Limiting**:
    Each user has a 3-second cooldown buffer (`SEARCH_COOLDOWN_SECONDS`) to prevent rapid automated searches from triggering Telegram API flood limits.
 
-3. **PM Enforcement**:
-   Group interactions are blocked by filtering handlers to `ChatType.PRIVATE`. If added to a group chat, the bot declines requests and informs members to search via Private Message.
->>>>>>> dc21ef7 (Initial commit: Movie & Series Librarian Bot with sub-second search and 24/7 cloud support)
+3. **Group Privacy & Direct Cloud Delivery**:
+   In group chats, media files are not dumped directly into the group conversation to protect the chat from spam and copyright notices. Instead, interactive search results provide instant deep-linking buttons to deliver files securely in Private Message with auto-destruct timers.

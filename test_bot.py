@@ -283,6 +283,124 @@ class TestMovieLibrarianBot(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(pm_btn.url)
         self.assertEqual(pm_btn.callback_data, "dl:650000000000000000000001")
 
+    async def test_09_season_pack_extraction_and_filtering(self):
+        """Verify season extraction, season filtering, and season count in database."""
+        await database.insert_movie(
+            title="Loki",
+            season_episode="S01E01",
+            quality="1080p",
+            file_size="1.2 GB"
+        )
+        await database.insert_movie(
+            title="Loki",
+            season_episode="S01E02",
+            quality="1080p",
+            file_size="1.1 GB"
+        )
+        await database.insert_movie(
+            title="Loki",
+            season_episode="S02E01",
+            quality="1080p",
+            file_size="1.3 GB"
+        )
+
+        # 1. Search with return_seasons=True
+        results, count, pages, qualities, seasons = await database.search_movies(
+            query="Loki",
+            page=1,
+            page_size=10,
+            return_seasons=True
+        )
+        self.assertEqual(count, 3)
+        self.assertIn("S01", seasons)
+        self.assertIn("S02", seasons)
+
+        # 2. Filter by Season 1
+        s1_results, s1_count, s1_pages, _, _ = await database.search_movies(
+            query="Loki",
+            page=1,
+            page_size=10,
+            season_filter="S01",
+            return_seasons=True
+        )
+        self.assertEqual(s1_count, 2)
+        for r in s1_results:
+            self.assertTrue(r["season_episode"].startswith("S01"))
+
+    async def test_10_season_episode_ordering_and_batch(self):
+        """Verify get_season_episodes returns all episodes in natural ascending episode order."""
+        await database.insert_movie(
+            title="Mirzapur",
+            season_episode="S02E05",
+            quality="1080p",
+            file_size="900 MB"
+        )
+        await database.insert_movie(
+            title="Mirzapur",
+            season_episode="S02E01",
+            quality="1080p",
+            file_size="850 MB"
+        )
+        await database.insert_movie(
+            title="Mirzapur",
+            season_episode="S02E02",
+            quality="1080p",
+            file_size="890 MB"
+        )
+
+        episodes = await database.get_season_episodes(query="Mirzapur", season="S02")
+        self.assertEqual(len(episodes), 3)
+        ep_codes = [e["season_episode"] for e in episodes]
+        self.assertEqual(ep_codes, ["S02E01", "S02E02", "S02E05"])
+
+    async def test_11_trailer_and_imdb_keyboard(self):
+        """Verify YouTube trailer link and IMDb ratings button in keyboard."""
+        meta = {
+            "title": "Inception",
+            "year": "2010",
+            "rating": "8.8",
+            "trailer_url": "https://www.youtube.com/watch?v=cdx31ak4KbQ",
+            "imdb_url": "https://www.imdb.com/title/tt1375666/",
+            "cast": ["Leonardo DiCaprio", "Joseph Gordon-Levitt"]
+        }
+        movies = [{
+            "_id": "650000000000000000000002",
+            "title": "Inception",
+            "quality": "1080p",
+            "file_size": "2.1 GB",
+            "season_episode": None
+        }]
+
+        markup = bot.build_search_keyboard(
+            results=movies,
+            current_page=1,
+            total_pages=1,
+            meta=meta,
+            available_seasons=["S01", "S02"],
+            active_season="S01",
+            total_count=1
+        )
+
+        # First row should be Trailer and IMDb buttons
+        first_row = markup.inline_keyboard[0]
+        button_texts = [b.text for b in first_row]
+        button_urls = [b.url for b in first_row]
+        self.assertTrue(any("Trailer" in t for t in button_texts))
+        self.assertIn("https://www.youtube.com/watch?v=cdx31ak4KbQ", button_urls)
+        self.assertTrue(any("IMDb" in t for t in button_texts))
+        self.assertIn("https://www.imdb.com/title/tt1375666/", button_urls)
+
+        # Second row should be Season folders
+        second_row = markup.inline_keyboard[1]
+        s_texts = [b.text for b in second_row]
+        self.assertTrue(any("All Seasons" in t for t in s_texts))
+        self.assertTrue(any("S1" in t for t in s_texts))
+        self.assertTrue(any("S2" in t for t in s_texts))
+
+        # Third row should be Batch download button for active season
+        third_row = markup.inline_keyboard[2]
+        self.assertTrue(any("Batch" in b.text or "Entire" in b.text for b in third_row))
+
 
 if __name__ == "__main__":
     unittest.main()

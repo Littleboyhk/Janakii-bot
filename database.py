@@ -91,21 +91,97 @@ def extract_available_qualities(matches: List[Dict[str, Any]]) -> List[str]:
     return [q for q in qualities_order if q in found]
 
 
+def extract_season_from_doc(doc: Dict[str, Any]) -> Optional[str]:
+    """Extract normalized season tag (e.g. 'S01', 'S02') from season_episode or title."""
+    se = doc.get("season_episode") or ""
+    m = re.search(r"(?i)\b(?:S|Season\s*)(\d{1,2})(?:[Ex\s]|$)", se)
+    if m:
+        return f"S{int(m.group(1)):02d}"
+    title = doc.get("title") or ""
+    m = re.search(r"(?i)\b(?:S|Season\s*)(\d{1,2})(?:[Ex\s]|$)", title)
+    if m:
+        return f"S{int(m.group(1)):02d}"
+    return None
+
+
+def extract_available_seasons(matches: List[Dict[str, Any]]) -> List[str]:
+    """Scan matches to discover all available season tags (e.g. ['S01', 'S02'])."""
+    found = set()
+    for m in matches:
+        s = extract_season_from_doc(m)
+        if s:
+            found.add(s)
+    return sorted(list(found))
+
+
+def parse_episode_num(doc: Dict[str, Any]) -> int:
+    """Extract numeric episode number for natural ascending ordering (e.g. S01E05 -> 5)."""
+    se = (doc.get("season_episode") or "") + " " + (doc.get("title") or "")
+    m = re.search(r"(?i)(?:E|Episode\s*|x)(\d{1,3})\b", se)
+    if m:
+        return int(m.group(1))
+    return 999
+
+
+async def get_season_episodes(
+    query: str,
+    season: str,
+    quality_filter: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """Retrieve all episodes belonging to a specific season, sorted in natural episode order."""
+    col = get_movies_collection()
+    escaped = re.escape(query.strip())
+    filter_query = {
+        "title": {
+            "$regex": escaped,
+            "$options": "i"
+        }
+    }
+    projection = {
+        "_id": 1,
+        "title": 1,
+        "quality": 1,
+        "file_size": 1,
+        "season_episode": 1,
+        "channel_id": 1,
+        "message_id": 1,
+        "file_id": 1,
+    }
+    cursor = col.find(filter_query, projection).limit(250)
+    matches = await cursor.to_list(length=250)
+    target_s = season.upper()
+    season_matches = [m for m in matches if extract_season_from_doc(m) == target_s]
+
+    if quality_filter and quality_filter.upper() != "ALL":
+        q_target = quality_filter.upper()
+        season_matches = [
+            m for m in season_matches
+            if q_target in (m.get("quality") or "").upper() or q_target in (m.get("title") or "").upper()
+        ]
+
+    season_matches.sort(key=parse_episode_num)
+    return season_matches
+
+
 async def search_movies(
     query: str,
     page: int = 1,
     page_size: int = 10,
     quality_filter: Optional[str] = None,
-    return_qualities: bool = False
+    season_filter: Optional[str] = None,
+    return_qualities: bool = False,
+    return_seasons: bool = False
 ) -> Any:
     """
     Search for movies matching title using case-insensitive regex.
     Results are sorted in descending order of file size (highest GB first).
-    Supports optional filtering by quality tag (e.g. '1080p', '720p', '4K').
+    Supports optional filtering by quality tag and season tag.
     """
     col = get_movies_collection()
     cleaned_query = query.strip()
     if not cleaned_query:
+        if return_seasons:
+            return ([], 0, 0, [], [])
         return ([], 0, 0, []) if return_qualities else ([], 0, 0)
 
     cache_key = cleaned_query.lower()
@@ -144,6 +220,8 @@ async def search_movies(
         all_matches = await cursor.to_list(length=MAX_SEARCH_POOL)
 
         if not all_matches:
+            if return_seasons:
+                return ([], 0, 0, [], [])
             return ([], 0, 0, []) if return_qualities else ([], 0, 0)
 
         # Sort so that highest GB files appear first
@@ -155,18 +233,29 @@ async def search_movies(
         _db_search_cache[cache_key] = (now, list(all_matches))
 
     available_qualities = extract_available_qualities(all_matches)
+    available_seasons = extract_available_seasons(all_matches)
+
+    # Apply season filter if requested and not "ALL"
+    filtered_matches = all_matches
+    if season_filter and season_filter.upper() != "ALL":
+        s_target = season_filter.upper()
+        filtered_matches = [
+            m for m in filtered_matches
+            if extract_season_from_doc(m) == s_target
+        ]
 
     # Apply quality filter if requested and not "ALL"
-    filtered_matches = all_matches
     if quality_filter and quality_filter.upper() != "ALL":
         q_target = quality_filter.upper()
         filtered_matches = [
-            m for m in all_matches
+            m for m in filtered_matches
             if q_target in (m.get("quality") or "").upper() or q_target in (m.get("title") or "").upper()
         ]
 
     total_count = len(filtered_matches)
     if total_count == 0:
+        if return_seasons:
+            return ([], 0, 0, available_qualities, available_seasons)
         return ([], 0, 0, available_qualities) if return_qualities else ([], 0, 0)
 
     total_pages = (total_count + page_size - 1) // page_size
@@ -175,6 +264,8 @@ async def search_movies(
     skip = (page - 1) * page_size
     results = filtered_matches[skip : skip + page_size]
 
+    if return_seasons:
+        return results, total_count, total_pages, available_qualities, available_seasons
     if return_qualities:
         return results, total_count, total_pages, available_qualities
     return results, total_count, total_pages

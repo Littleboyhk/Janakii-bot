@@ -55,6 +55,10 @@ user_last_search: Dict[int, float] = {}
 # {chat_id: set([message_id, ...])}
 chat_messages: Dict[int, set] = {}
 
+# In-memory cache for batch season download sessions (for group deep-linking)
+# {token: {"query": str, "season": str, "quality": str}}
+batch_sessions: Dict[str, Dict[str, Any]] = {}
+
 def track_chat_message(chat_id: int, message_id: int) -> None:
     """Record a message ID to be automatically cleaned up for this chat."""
     if not chat_id or not message_id:
@@ -177,21 +181,80 @@ def build_search_keyboard(
     total_pages: int,
     available_qualities: Optional[List[str]] = None,
     active_filter: str = "ALL",
+    available_seasons: Optional[List[str]] = None,
+    active_season: str = "ALL",
+    total_count: int = 0,
+    meta: Optional[Dict[str, Any]] = None,
+    query_text: str = "",
     is_group: bool = False,
     bot_username: Optional[str] = None
 ) -> InlineKeyboardMarkup:
     """
-    Construct the inline keyboard displaying movie search results and pagination buttons.
-    In Groups: Movie buttons use deep-linking URLs (https://t.me/Janakii_bot?start=dl_<id>)
-               with external link indicator (↗) to deliver files securely in PM.
-    In PM: Movie buttons use direct callback_data (dl:<id>) for instant in-chat delivery.
-    Top row: Quality Filter Buttons (All, 4K, 1080p, 720p, etc.)
-    Bottom row: Pagination (<< Prev, Page X/Y, Next >>)
+    Construct the inline keyboard displaying movie search results and controls:
+    1. Media action buttons (YouTube Trailer ↗ & IMDb rating ↗)
+    2. Season folder filter buttons (e.g. [📁 S1], [📁 S2])
+    3. 1-Click Season Batch download button (e.g. [📦 Download Entire S1 (10 Ep)])
+    4. Quality filter buttons (All, 4K, 1080p, 720p, etc.)
+    5. Movie/Episode result buttons (URL deep-links in groups, callback_data in PM)
+    6. Pagination navigation row (<< Prev, Page X/Y, Next >>)
     """
     username = bot_username or BOT_USERNAME
     keyboard = []
 
-    # 1. Quality Filter Row(s) if multiple qualities exist
+    # 1. Quick Media Links (Trailer & IMDb) from Cinemeta metadata
+    if meta:
+        media_row = []
+        trailer_url = meta.get("trailer_url")
+        if trailer_url:
+            media_row.append(InlineKeyboardButton(text="🍿 Watch Trailer ↗", url=trailer_url))
+        imdb_url = meta.get("imdb_url")
+        rating = meta.get("rating")
+        if imdb_url and rating:
+            media_row.append(InlineKeyboardButton(text=f"⭐ IMDb {rating} ↗", url=imdb_url))
+        elif imdb_url:
+            media_row.append(InlineKeyboardButton(text="⭐ IMDb ↗", url=imdb_url))
+        if media_row:
+            keyboard.append(media_row)
+
+    # 2. Season Folders Row (if TV series or multiple seasons detected)
+    if available_seasons and len(available_seasons) > 0:
+        s_buttons = []
+        all_s_label = "🌟 All Seasons" if active_season.upper() == "ALL" else "All Seasons"
+        s_buttons.append(InlineKeyboardButton(text=all_s_label, callback_data="sfilter:ALL"))
+        for s in available_seasons:
+            s_num = int(s[1:]) if len(s) > 1 and s[1:].isdigit() else s
+            lbl = f"✅ S{s_num}" if s.upper() == active_season.upper() else f"📁 S{s_num}"
+            s_buttons.append(InlineKeyboardButton(text=lbl, callback_data=f"sfilter:{s}"))
+        for i in range(0, len(s_buttons), 4):
+            keyboard.append(s_buttons[i : i + 4])
+
+    # 3. Batch Download Season Button (when viewing a specific season or single-season series)
+    target_season = None
+    if active_season.upper() != "ALL":
+        target_season = active_season
+    elif available_seasons and len(available_seasons) == 1 and total_count > 1:
+        target_season = available_seasons[0]
+
+    if target_season and total_count > 0:
+        s_num_str = f"Season {int(target_season[1:])}" if len(target_season) > 1 and target_season[1:].isdigit() else target_season
+        if is_group:
+            import secrets
+            token = secrets.token_hex(4)
+            batch_sessions[token] = {
+                "query": query_text,
+                "season": target_season,
+                "quality": active_filter
+            }
+            url = f"https://t.me/{username}?start=batch_{token}"
+            keyboard.append([
+                InlineKeyboardButton(text=f"📦 Download Entire {s_num_str} ({total_count} Ep) ↗", url=url)
+            ])
+        else:
+            keyboard.append([
+                InlineKeyboardButton(text=f"📦 Download Entire {s_num_str} ({total_count} Ep)", callback_data=f"batch_s:{target_season}")
+            ])
+
+    # 4. Quality Filter Row(s) if multiple qualities exist
     if available_qualities and len(available_qualities) > 0:
         filter_buttons = []
         all_label = "🌟 All" if active_filter.upper() == "ALL" else "All"
@@ -208,7 +271,7 @@ def build_search_keyboard(
         for i in range(0, len(filter_buttons), 4):
             keyboard.append(filter_buttons[i : i + 4])
 
-    # 2. Movie Result Buttons (1 per row)
+    # 5. Movie / Episode Result Buttons (1 per row)
     for movie in results:
         btn_text = database.format_movie_button_text(movie)
         if is_group:
@@ -220,7 +283,7 @@ def build_search_keyboard(
             callback_data = f"dl:{str(movie['_id'])}"
             keyboard.append([InlineKeyboardButton(text=btn_text, callback_data=callback_data)])
 
-    # 3. Pagination Navigation Row
+    # 6. Pagination Navigation Row
     nav_buttons = []
     if current_page > 1:
         nav_buttons.append(
@@ -286,6 +349,148 @@ async def auto_delete_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 # ==============================================================================
 # Telegram Handlers & Delivery Engine
 # ==============================================================================
+
+async def send_single_media_file(bot, chat_id: int, movie: Dict[str, Any]) -> Optional[Any]:
+    """Helper to deliver a media file using copy_message or send_document/send_video."""
+    channel_id = movie.get("channel_id")
+    msg_id = movie.get("message_id")
+    file_id = movie.get("file_id")
+
+    # Option 1: Direct copy from channel if channel_id & message_id are present
+    if channel_id and msg_id:
+        try:
+            return await bot.copy_message(
+                chat_id=chat_id,
+                from_chat_id=channel_id,
+                message_id=msg_id
+            )
+        except Exception as e:
+            logger.warning("copy_message failed (%s), attempting file_id fallback...", e)
+
+    # Option 2: Fallback or primary delivery via Telegram File ID
+    if file_id:
+        title = movie.get("title", "Media")
+        se = f" {movie.get('season_episode')}" if movie.get("season_episode") else ""
+        qual = f" {movie.get('quality')}" if movie.get("quality") else ""
+        size = f" {movie.get('file_size')}" if movie.get("file_size") else ""
+        caption = f"🎬 **{title}{se}**\n📦 Size: `{size.strip()}`{qual}"
+        try:
+            return await bot.send_document(
+                chat_id=chat_id,
+                document=file_id,
+                caption=caption,
+                parse_mode=ParseMode.MARKDOWN
+            )
+        except BadRequest as e:
+            logger.warning("Failed to send as document (%s), attempting fallback to send_video...", e)
+            try:
+                return await bot.send_video(
+                    chat_id=chat_id,
+                    video=file_id,
+                    caption=caption,
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            except Exception as err2:
+                logger.error("Failed to send media via fallback: %s", err2)
+        except Exception as e:
+            logger.error("Failed to send file: %s", e)
+
+    return None
+
+
+async def deliver_batch_to_user(
+    chat_id: int,
+    user,
+    query_text: str,
+    season: str,
+    context: ContextTypes.DEFAULT_TYPE,
+    quality_filter: Optional[str] = None
+) -> None:
+    """Deliver an entire season of episodes sequentially to user with cooldown delay."""
+    # 1. Force-Subscription Check
+    subscribed, reason = await is_user_subscribed(user.id, context.bot)
+    if not subscribed:
+        if reason == "bot_not_admin":
+            bot_me = await context.bot.get_me()
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "⚠️ **Bot Configuration Required**\n\n"
+                    f"The bot cannot verify channel members because **@{bot_me.username}** has not been added as an **Administrator** in your channel."
+                ),
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+
+        invite_link = await get_force_sub_invite_link(context.bot)
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📢 Join Our Channel", url=invite_link)],
+            [InlineKeyboardButton("🔄 I Have Joined / Verify", callback_data="check_fsub")]
+        ])
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"👋 Hello **{user.first_name}**!\n\n⚠️ **Access Required**\nTo batch download this season, please join our official channel first.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=keyboard
+        )
+        return
+
+    episodes = await database.get_season_episodes(query_text, season, quality_filter)
+    if not episodes:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"⚠️ No episodes found for season **{season}**.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    status_msg = await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"📦 **Starting Batch Delivery**\n🎬 Delivering **{len(episodes)}** episodes of **{season}**...\n*(Please do not leave this chat)*",
+        parse_mode=ParseMode.MARKDOWN
+    )
+    track_chat_message(chat_id, status_msg.message_id)
+
+    delivered_mids = [status_msg.message_id]
+    count_delivered = 0
+
+    for ep in episodes:
+        try:
+            sent_msg = await send_single_media_file(context.bot, chat_id, ep)
+            if sent_msg:
+                delivered_mids.append(sent_msg.message_id)
+                track_chat_message(chat_id, sent_msg.message_id)
+                count_delivered += 1
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            logger.error("Error delivering episode in batch: %s", e)
+
+    done_msg = await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"✅ **Batch Complete!**\n"
+            f"Delivered **{count_delivered}/{len(episodes)}** episodes of **{season}**.\n\n"
+            f"⚠️ **These files will self-destruct in {config.AUTO_DELETE_SECONDS}s!**\n"
+            f"👉 *Please forward or save them to your Saved Messages immediately.*"
+        ),
+        parse_mode=ParseMode.MARKDOWN
+    )
+    delivered_mids.append(done_msg.message_id)
+    track_chat_message(chat_id, done_msg.message_id)
+
+    # Schedule auto-deletion
+    if context.job_queue:
+        context.job_queue.run_once(
+            auto_delete_job,
+            when=config.AUTO_DELETE_SECONDS,
+            data={
+                "chat_id": chat_id,
+                "message_ids": delivered_mids,
+                "clean_all": False
+            },
+            name=f"del_batch_{chat_id}_{status_msg.message_id}"
+        )
+
 
 async def deliver_movie_to_user(
     chat_id: int,
@@ -358,56 +563,19 @@ async def deliver_movie_to_user(
     )
     sent_file_msg = None
     try:
-        # Option 1: Direct copy from channel if channel_id & message_id are present
-        channel_id = movie.get("channel_id")
-        msg_id = movie.get("message_id")
-        if channel_id and msg_id:
-            try:
-                # Do NOT specify caption so Telegram preserves authentic original caption!
-                sent_file_msg = await context.bot.copy_message(
-                    chat_id=chat_id,
-                    from_chat_id=channel_id,
-                    message_id=msg_id
-                )
-            except Exception as e:
-                logger.warning("copy_message failed (%s), attempting file_id fallback...", e)
-
-        # Option 2: Fallback or primary delivery via Telegram File ID
-        file_id = movie.get("file_id")
-        if not sent_file_msg and file_id:
-            fallback_caption = f"🎬 **{movie.get('title')}**\n📦 Size: `{movie.get('file_size')}`"
-            try:
-                sent_file_msg = await context.bot.send_document(
-                    chat_id=chat_id,
-                    document=file_id,
-                    caption=fallback_caption,
-                    parse_mode=ParseMode.MARKDOWN
-                )
-            except BadRequest as e:
-                logger.warning("Failed to send as document (%s), attempting fallback to send_video...", e)
-                try:
-                    sent_file_msg = await context.bot.send_video(
-                        chat_id=chat_id,
-                        video=file_id,
-                        caption=fallback_caption,
-                        parse_mode=ParseMode.MARKDOWN
-                    )
-                except Exception as err2:
-                    logger.error("Failed to send media via fallback: %s", err2)
-                    await status_msg.edit_text(f"❌ Failed to send file. Error: {err2}")
-                    return
-            except Exception as e:
-                logger.error("Failed to send file: %s", e)
-                await status_msg.edit_text(f"❌ Error sending file: {e}")
-                return
+        sent_file_msg = await send_single_media_file(context.bot, chat_id, movie)
+        if not sent_file_msg:
+            await status_msg.edit_text("❌ Could not deliver media file. File may be unavailable on Telegram cloud.")
+            return
+    except Exception as e:
+        logger.error("Failed to send file: %s", e)
+        await status_msg.edit_text(f"❌ Error sending file: {e}")
+        return
     finally:
         try:
             await status_msg.delete()
         except Exception:
             pass
-
-    if not sent_file_msg:
-        return
 
     track_chat_message(chat_id, sent_file_msg.message_id)
 
@@ -461,18 +629,19 @@ async def deliver_movie_to_user(
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Handler for /start command in private messages.
-    Supports deep-linking (e.g., /start dl_<ObjectId>) from groups and external links.
+    Handler for /start command in private messages and groups.
+    Supports deep-linking (e.g., /start dl_<ObjectId> or /start batch_<token>).
     """
     if not update.effective_user or not update.effective_chat:
         return
 
     user = update.effective_user
     chat_id = update.effective_chat.id
+    is_group = update.effective_chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]
 
     track_chat_message(chat_id, update.message.message_id)
 
-    # Check for deep-linking download request: /start dl_<movie_id>
+    # Check for deep-linking download request: /start dl_<movie_id> or /start batch_<token>
     if context.args and len(context.args) > 0:
         arg = context.args[0]
         if arg.startswith("dl_"):
@@ -485,6 +654,43 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 status_reply_to_mid=update.message.message_id
             )
             return
+        elif arg.startswith("batch_"):
+            token = arg[6:]
+            session = batch_sessions.get(token)
+            if session:
+                await deliver_batch_to_user(
+                    chat_id=chat_id,
+                    user=user,
+                    query_text=session["query"],
+                    season=session["season"],
+                    context=context,
+                    quality_filter=session.get("quality", "ALL")
+                )
+                return
+            else:
+                await update.message.reply_text(
+                    "⚠️ **Batch download session expired.**\nPlease search for the series again to get a fresh download link.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                return
+
+    # If invoked directly in group (without deep link), show friendly intro card
+    if is_group:
+        welcome_group_msg = await update.message.reply_text(
+            f"👋 Hello **{user.first_name}**!\n\n"
+            "🎬 **Janakii Media Librarian is Active in this Group!**\n\n"
+            "🔍 To find movies or series, simply type the title in chat or use:\n"
+            "`/search <movie or series name>`\n\n"
+            "🍿 **New Features:**\n"
+            "• 🍿 YouTube Trailer streaming previews\n"
+            "• ⭐ IMDb ratings, runtime & cast details\n"
+            "• 📁 TV Show Season folder navigation\n"
+            "• 📦 1-Click Season Batch Downloads\n"
+            "• 💿 One-touch Quality Filters (4K, 1080p, 720p)",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        track_chat_message(chat_id, welcome_group_msg.message_id)
+        return
 
     # Check Force-Subscription
     subscribed, reason = await is_user_subscribed(user.id, context.bot)
@@ -682,11 +888,11 @@ async def execute_search(
             query=query_text,
             page=1,
             page_size=config.RESULTS_PER_PAGE,
-            return_qualities=True
+            return_seasons=True
         )
     )
 
-    meta, (results, total_count, total_pages, available_qualities) = await asyncio.gather(
+    meta, (results, total_count, total_pages, available_qualities, available_seasons) = await asyncio.gather(
         meta_task,
         search_task
     )
@@ -719,11 +925,15 @@ async def execute_search(
     context.user_data["last_search_meta"] = meta
     context.user_data["available_qualities"] = available_qualities
     context.user_data["active_qfilter"] = "ALL"
+    context.user_data["available_seasons"] = available_seasons
+    context.user_data["active_sfilter"] = "ALL"
 
     context.chat_data["last_search_query"] = query_text
     context.chat_data["last_search_meta"] = meta
     context.chat_data["available_qualities"] = available_qualities
     context.chat_data["active_qfilter"] = "ALL"
+    context.chat_data["available_seasons"] = available_seasons
+    context.chat_data["active_sfilter"] = "ALL"
 
     # 5. Build Netflix Info Card & Adaptive Keyboard
     reply_markup = build_search_keyboard(
@@ -732,6 +942,11 @@ async def execute_search(
         total_pages=total_pages,
         available_qualities=available_qualities,
         active_filter="ALL",
+        available_seasons=available_seasons,
+        active_season="ALL",
+        total_count=total_count,
+        meta=meta,
+        query_text=query_text,
         is_group=is_group,
         bot_username=BOT_USERNAME
     )
@@ -741,7 +956,8 @@ async def execute_search(
         total_count=total_count,
         current_page=1,
         total_pages=total_pages,
-        active_filter="ALL"
+        active_filter="ALL",
+        active_season="ALL"
     )
 
     # Send rich Markdown text card directly for instant (~0.15s) delivery without remote photo fetch lag
@@ -759,7 +975,9 @@ async def execute_search(
         "query": query_text,
         "meta": meta,
         "qualities": available_qualities,
-        "active_filter": "ALL"
+        "active_filter": "ALL",
+        "seasons": available_seasons,
+        "active_season": "ALL"
     }
 
     # Schedule auto-deletion after AUTO_DELETE_SECONDS (300s)
@@ -881,14 +1099,15 @@ async def handle_pagination_callback(update: Update, context: ContextTypes.DEFAU
         return
 
     active_filter = stored.get("active_filter") or context.chat_data.get("active_qfilter") or context.user_data.get("active_qfilter", "ALL")
-    available_qualities = stored.get("qualities") or context.chat_data.get("available_qualities") or context.user_data.get("available_qualities")
+    active_season = stored.get("active_season") or context.chat_data.get("active_sfilter", "ALL")
 
-    results, total_count, total_pages, _ = await database.search_movies(
+    results, total_count, total_pages, available_qualities, available_seasons = await database.search_movies(
         query=search_query,
         page=target_page,
         page_size=config.RESULTS_PER_PAGE,
         quality_filter=active_filter,
-        return_qualities=True
+        season_filter=active_season,
+        return_seasons=True
     )
 
     if not results:
@@ -896,23 +1115,29 @@ async def handle_pagination_callback(update: Update, context: ContextTypes.DEFAU
         return
 
     is_group = query.message.chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]
+    meta = stored.get("meta") or context.chat_data.get("last_search_meta") or context.user_data.get("last_search_meta")
     reply_markup = build_search_keyboard(
         results=results,
         current_page=target_page,
-        total_pages=total_pages,
+        total_pages=total_pages if total_pages > 0 else 1,
         available_qualities=available_qualities,
         active_filter=active_filter,
+        available_seasons=available_seasons,
+        active_season=active_season,
+        total_count=total_count,
+        meta=meta,
+        query_text=search_query,
         is_group=is_group,
         bot_username=BOT_USERNAME
     )
-    meta = stored.get("meta") or context.chat_data.get("last_search_meta") or context.user_data.get("last_search_meta")
     card_text = metadata.format_netflix_card(
         meta=meta,
         query=search_query,
         total_count=total_count,
         current_page=target_page,
-        total_pages=total_pages,
-        active_filter=active_filter
+        total_pages=total_pages if total_pages > 0 else 1,
+        active_filter=active_filter,
+        active_season=active_season
     )
 
     try:
@@ -962,34 +1187,42 @@ async def handle_quality_filter_callback(update: Update, context: ContextTypes.D
     context.chat_data["active_qfilter"] = selected_quality
     context.user_data["active_qfilter"] = selected_quality
 
+    active_season = stored.get("active_season") or context.chat_data.get("active_sfilter", "ALL")
+
     # Re-run search with quality filter on Page 1
-    results, total_count, total_pages, _ = await database.search_movies(
+    results, total_count, total_pages, available_qualities, available_seasons = await database.search_movies(
         query=search_query,
         page=1,
         page_size=config.RESULTS_PER_PAGE,
         quality_filter=selected_quality,
-        return_qualities=True
+        season_filter=active_season,
+        return_seasons=True
     )
 
-    available_qualities = stored.get("qualities") or context.chat_data.get("available_qualities") or context.user_data.get("available_qualities")
     is_group = query.message.chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]
+    meta = stored.get("meta") or context.chat_data.get("last_search_meta") or context.user_data.get("last_search_meta")
     reply_markup = build_search_keyboard(
         results=results,
         current_page=1,
         total_pages=total_pages if total_pages > 0 else 1,
         available_qualities=available_qualities,
         active_filter=selected_quality,
+        available_seasons=available_seasons,
+        active_season=active_season,
+        total_count=total_count,
+        meta=meta,
+        query_text=search_query,
         is_group=is_group,
         bot_username=BOT_USERNAME
     )
-    meta = stored.get("meta") or context.chat_data.get("last_search_meta") or context.user_data.get("last_search_meta")
     card_text = metadata.format_netflix_card(
         meta=meta,
         query=search_query,
         total_count=total_count,
         current_page=1,
         total_pages=total_pages if total_pages > 0 else 1,
-        active_filter=selected_quality
+        active_filter=selected_quality,
+        active_season=active_season
     )
 
     try:
@@ -1008,6 +1241,122 @@ async def handle_quality_filter_callback(update: Update, context: ContextTypes.D
     except BadRequest as e:
         if "Message is not modified" not in str(e):
             logger.error("Error editing quality filter message: %s", e)
+
+
+async def handle_season_filter_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Handle one-touch season folder button presses (e.g. callback_data='sfilter:S01').
+    Filters search results dynamically by season and refreshes the card without resetting session.
+    """
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+    if not data.startswith("sfilter:"):
+        return
+
+    selected_season = data.split(":", 1)[1].strip()
+    msg_id = query.message.message_id
+    stored = context.chat_data.get(f"search_{msg_id}") or {}
+    search_query = stored.get("query") or context.chat_data.get("last_search_query") or context.user_data.get("last_search_query")
+    if not search_query:
+        await query.answer("⚠️ Search session expired. Please search again.", show_alert=True)
+        return
+
+    current_active_season = stored.get("active_season") or context.chat_data.get("active_sfilter", "ALL")
+    if selected_season.upper() == current_active_season.upper():
+        return
+
+    stored["active_season"] = selected_season
+    context.chat_data[f"search_{msg_id}"] = stored
+    context.chat_data["active_sfilter"] = selected_season
+    context.user_data["active_sfilter"] = selected_season
+
+    active_filter = stored.get("active_filter") or context.chat_data.get("active_qfilter", "ALL")
+
+    # Re-run search with season filter on Page 1
+    results, total_count, total_pages, available_qualities, available_seasons = await database.search_movies(
+        query=search_query,
+        page=1,
+        page_size=config.RESULTS_PER_PAGE,
+        quality_filter=active_filter,
+        season_filter=selected_season,
+        return_seasons=True
+    )
+
+    is_group = query.message.chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]
+    meta = stored.get("meta") or context.chat_data.get("last_search_meta") or context.user_data.get("last_search_meta")
+    reply_markup = build_search_keyboard(
+        results=results,
+        current_page=1,
+        total_pages=total_pages if total_pages > 0 else 1,
+        available_qualities=available_qualities,
+        active_filter=active_filter,
+        available_seasons=available_seasons,
+        active_season=selected_season,
+        total_count=total_count,
+        meta=meta,
+        query_text=search_query,
+        is_group=is_group,
+        bot_username=BOT_USERNAME
+    )
+    card_text = metadata.format_netflix_card(
+        meta=meta,
+        query=search_query,
+        total_count=total_count,
+        current_page=1,
+        total_pages=total_pages if total_pages > 0 else 1,
+        active_filter=active_filter,
+        active_season=selected_season
+    )
+
+    try:
+        if query.message and query.message.photo:
+            await query.edit_message_caption(
+                caption=card_text,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=reply_markup
+            )
+        else:
+            await query.edit_message_text(
+                card_text,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=reply_markup
+            )
+    except BadRequest as e:
+        if "Message is not modified" not in str(e):
+            logger.error("Error editing season filter message: %s", e)
+
+
+async def handle_batch_download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle 1-click batch download for an entire season in PM (callback_data='batch_s:S01')."""
+    query = update.callback_query
+    await query.answer("Starting season batch download...", show_alert=False)
+
+    data = query.data
+    if not data.startswith("batch_s:"):
+        return
+
+    season = data.split(":", 1)[1].strip()
+    msg_id = query.message.message_id
+    stored = context.chat_data.get(f"search_{msg_id}") or {}
+    search_query = stored.get("query") or context.chat_data.get("last_search_query") or context.user_data.get("last_search_query")
+    if not search_query:
+        await query.answer("⚠️ Session expired. Please search again.", show_alert=True)
+        return
+
+    active_filter = stored.get("active_filter", "ALL")
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+
+    await deliver_batch_to_user(
+        chat_id=chat_id,
+        user=user,
+        query_text=search_query,
+        season=season,
+        context=context,
+        quality_filter=active_filter
+    )
 
 
 async def handle_download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1285,7 +1634,7 @@ def main() -> None:
 
     # 1. Command Handlers (PM and Groups)
     application.add_handler(
-        CommandHandler("start", start_command, filters=filters.ChatType.PRIVATE)
+        CommandHandler("start", start_command)
     )
     application.add_handler(
         CommandHandler("search", search_command)
@@ -1299,6 +1648,8 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(noop_callback, pattern=r"^noop$"))
     application.add_handler(CallbackQueryHandler(handle_pagination_callback, pattern=r"^page_\d+$"))
     application.add_handler(CallbackQueryHandler(handle_quality_filter_callback, pattern=r"^qfilter:.+$"))
+    application.add_handler(CallbackQueryHandler(handle_season_filter_callback, pattern=r"^sfilter:.+$"))
+    application.add_handler(CallbackQueryHandler(handle_batch_download_callback, pattern=r"^batch_s:.+$"))
     application.add_handler(CallbackQueryHandler(handle_download_callback, pattern=r"^dl:.+$"))
 
     # 3. Diagnostic handler for forwarded messages from channels

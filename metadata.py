@@ -73,8 +73,8 @@ async def fetch_movie_meta(raw_title: str) -> Optional[Dict[str, Any]]:
     meta = None
     client = get_http_client()
     try:
-        # Enforce 350ms maximum ceiling for metadata lookup
-        meta = await asyncio.wait_for(_lookup_meta(client, clean_title), timeout=0.35)
+        # Enforce 650ms ceiling for metadata lookup
+        meta = await asyncio.wait_for(_lookup_meta(client, clean_title), timeout=0.65)
     except (asyncio.TimeoutError, Exception) as e:
         logger.debug("Metadata lookup timed out or failed for '%s': %s", clean_title, e)
         meta = None
@@ -122,8 +122,15 @@ async def _search_catalog(client: httpx.AsyncClient, cat_type: str, title: str) 
         genres = []
         runtime = None
         plot = None
+        trailer_url = None
+        imdb_url = None
+        cast = []
+        director = None
 
-        # Try rapid detail view for rating, genres, plot
+        if imdb_id and str(imdb_id).startswith("tt"):
+            imdb_url = f"https://www.imdb.com/title/{imdb_id}/"
+
+        # Try rapid detail view for rating, genres, plot, trailers, cast
         if imdb_id:
             try:
                 detail_url = f"https://v3-cinemeta.strem.io/meta/{cat_type}/{imdb_id}.json"
@@ -138,8 +145,33 @@ async def _search_catalog(client: httpx.AsyncClient, cat_type: str, title: str) 
                     plot = d_meta.get("description")
                     if not poster:
                         poster = d_meta.get("poster")
+
+                    # Extract YouTube Trailer stream / source
+                    for ts in d_meta.get("trailerStreams", []):
+                        if isinstance(ts, dict) and ts.get("ytId"):
+                            trailer_url = f"https://www.youtube.com/watch?v={ts['ytId']}"
+                            break
+                    if not trailer_url:
+                        for t in d_meta.get("trailers", []):
+                            if isinstance(t, dict) and t.get("source") and t.get("type", "").lower() == "trailer":
+                                trailer_url = f"https://www.youtube.com/watch?v={t['source']}"
+                                break
+
+                    # Extract cast & director
+                    d_cast = d_meta.get("cast", [])
+                    if isinstance(d_cast, list) and d_cast:
+                        cast = d_cast[:3]
+                    d_dir = d_meta.get("director", [])
+                    if isinstance(d_dir, list) and d_dir:
+                        director = d_dir[0]
             except Exception:
                 pass
+
+        # Fallback YouTube trailer search URL if direct video ID not found
+        if not trailer_url and (name or title):
+            import urllib.parse
+            q_str = f"{name or title} {year or ''} official trailer".strip()
+            trailer_url = f"https://www.youtube.com/results?search_query={urllib.parse.quote_plus(q_str)}"
 
         return {
             "title": name,
@@ -149,6 +181,11 @@ async def _search_catalog(client: httpx.AsyncClient, cat_type: str, title: str) 
             "runtime": runtime,
             "poster": poster,
             "plot": plot,
+            "trailer_url": trailer_url,
+            "imdb_url": imdb_url,
+            "imdb_id": imdb_id,
+            "cast": cast,
+            "director": director,
             "is_series": (cat_type == "series")
         }
     except Exception as e:
@@ -162,7 +199,8 @@ def format_netflix_card(
     total_count: int,
     current_page: int,
     total_pages: int,
-    active_filter: str = "ALL"
+    active_filter: str = "ALL",
+    active_season: str = "ALL"
 ) -> str:
     """Format a rich Netflix-style movie info card in Markdown."""
     lines = []
@@ -185,6 +223,10 @@ def format_netflix_card(
             genre_text = ", ".join(meta.get("genres"))
             lines.append(f"🎭 *{genre_text}*")
 
+        cast = meta.get("cast")
+        if cast:
+            lines.append(f"👥 *Cast:* {', '.join(cast)}")
+
         plot = meta.get("plot")
         if plot:
             # Truncate plot for clean card layout
@@ -197,8 +239,15 @@ def format_netflix_card(
 
     # Divider & count summary
     lines.append("\n━━━━━━━━━━━━━━━━━━━━")
-    filter_label = f" [{active_filter}]" if active_filter != "ALL" else ""
-    lines.append(f"📊 **{total_count}** file(s) available{filter_label} • Page {current_page}/{total_pages}")
+    filter_tags = []
+    if active_season != "ALL":
+        filter_tags.append(active_season)
+    if active_filter != "ALL":
+        filter_tags.append(active_filter)
+    filter_label = f" [{' • '.join(filter_tags)}]" if filter_tags else ""
+
+    item_type = "episode(s)" if (meta and meta.get("is_series")) or (active_season != "ALL") else "file(s)"
+    lines.append(f"📊 **{total_count}** {item_type} available{filter_label} • Page {current_page}/{total_pages}")
     lines.append("👇 *Tap a file below to download:*")
 
     return "\n".join(lines)
