@@ -465,14 +465,51 @@ async def deliver_batch_to_user(
         except Exception as e:
             logger.error("Error delivering episode in batch: %s", e)
 
-    done_msg = await context.bot.send_message(
-        chat_id=chat_id,
-        text=(
-            f"✅ **Batch Complete!**\n"
-            f"Delivered **{count_delivered}/{len(episodes)}** episodes of **{season}**.\n\n"
+    if count_delivered == 0:
+        done_msg = await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"⚠️ **Batch Delivery Notice**\n\n"
+                f"Delivered **0/{len(episodes)}** episodes of **{season}**.\n\n"
+                f"❌ **Could not deliver files:** None of the episodes could be transferred. "
+                f"These records may be sample test entries with dummy file IDs or the media is missing from Telegram storage."
+            ),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        delivered_mids.append(done_msg.message_id)
+        track_chat_message(chat_id, done_msg.message_id)
+        if context.job_queue:
+            context.job_queue.run_once(
+                auto_delete_job,
+                when=30,
+                data={
+                    "chat_id": chat_id,
+                    "message_ids": delivered_mids,
+                    "clean_all": False
+                },
+                name=f"del_batch_fail_{chat_id}_{status_msg.message_id}"
+            )
+        return
+
+    if count_delivered < len(episodes):
+        done_text = (
+            f"⚠️ **Batch Partially Delivered**\n"
+            f"Delivered **{count_delivered}/{len(episodes)}** episodes of **{season}**.\n"
+            f"*(Some files could not be sent or have expired)*\n\n"
             f"⚠️ **These files will self-destruct in {config.AUTO_DELETE_SECONDS}s!**\n"
             f"👉 *Please forward or save them to your Saved Messages immediately.*"
-        ),
+        )
+    else:
+        done_text = (
+            f"✅ **Batch Complete!**\n"
+            f"Delivered all **{count_delivered}/{len(episodes)}** episodes of **{season}**.\n\n"
+            f"⚠️ **These files will self-destruct in {config.AUTO_DELETE_SECONDS}s!**\n"
+            f"👉 *Please forward or save them to your Saved Messages immediately.*"
+        )
+
+    done_msg = await context.bot.send_message(
+        chat_id=chat_id,
+        text=done_text,
         parse_mode=ParseMode.MARKDOWN
     )
     delivered_mids.append(done_msg.message_id)

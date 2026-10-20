@@ -12,11 +12,13 @@ Validates:
 
 import asyncio
 import unittest
+from unittest.mock import patch, AsyncMock, MagicMock
 from mongomock_motor import AsyncMongoMockClient
 
 import database
 import bot
 import config
+import metadata
 
 
 class TestMovieLibrarianBot(unittest.IsolatedAsyncioTestCase):
@@ -401,8 +403,64 @@ class TestMovieLibrarianBot(unittest.IsolatedAsyncioTestCase):
         third_row = markup.inline_keyboard[2]
         self.assertTrue(any("Batch" in b.text or "Entire" in b.text for b in third_row))
 
+    async def test_12_batch_delivery_feedback_handling(self):
+        """Verify batch delivery produces appropriate failure warning when count is 0."""
+        class MockUser:
+            id = 12345
+            first_name = "TestUser"
+
+        class MockBot:
+            async def send_message(self, chat_id, text, **kwargs):
+                class Msg:
+                    message_id = 999
+                    pass
+                msg = Msg()
+                msg.text = text
+                return msg
+
+        class MockContext:
+            bot = MockBot()
+            job_queue = None
+
+        with patch("bot.is_user_subscribed", new_callable=AsyncMock) as mock_sub, \
+             patch("database.get_season_episodes", new_callable=AsyncMock) as mock_eps, \
+             patch("bot.send_single_media_file", new_callable=AsyncMock) as mock_send, \
+             patch.object(MockBot, "send_message", new_callable=AsyncMock) as mock_send_msg:
+
+            mock_sub.return_value = (True, "subscribed")
+            mock_eps.return_value = [{"title": "Show", "season_episode": "S01E01", "file_id": "dummy"}]
+            mock_send.return_value = None  # Simulates failed Telegram delivery
+
+            mock_msg = MagicMock()
+            mock_msg.message_id = 100
+            mock_send_msg.return_value = mock_msg
+
+            await bot.deliver_batch_to_user(
+                chat_id=12345,
+                user=MockUser(),
+                query_text="Show",
+                season="S01",
+                context=MockContext()
+            )
+
+            # Check that final message reported failure notice, not 'Batch Complete!'
+            calls = mock_send_msg.call_args_list
+            last_text = calls[-1].kwargs.get("text", "")
+            self.assertIn("Delivered **0/1**", last_text)
+            self.assertIn("Could not deliver files", last_text)
+            self.assertNotIn("Batch Complete!", last_text)
+
+    async def test_13_metadata_series_preference(self):
+        """Verify metadata engine correctly resolves TV series when title matches."""
+        meta = await metadata.fetch_movie_meta("Ultimate Spider-Man")
+        self.assertIsNotNone(meta)
+        self.assertEqual(meta.get("title"), "Ultimate Spider-Man")
+        self.assertIsNotNone(meta.get("trailer_url"))
+        self.assertIsNotNone(meta.get("rating"))
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 

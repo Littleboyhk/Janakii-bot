@@ -27,7 +27,7 @@ def get_http_client() -> httpx.AsyncClient:
     global _http_client
     if _http_client is None or _http_client.is_closed:
         _http_client = httpx.AsyncClient(
-            timeout=0.8,
+            timeout=3.5,
             follow_redirects=True,
             limits=httpx.Limits(max_keepalive_connections=20, max_connections=50, keepalive_expiry=60.0)
         )
@@ -61,38 +61,58 @@ def clean_query_for_meta(raw_query: str) -> str:
 
 async def fetch_movie_meta(raw_title: str) -> Optional[Dict[str, Any]]:
     """
-    Query Cinemeta for metadata with sub-second execution guarantee.
-    Enforces a strict 350ms deadline so user searches are never delayed.
+    Query Cinemeta for metadata (posters, ratings, trailers, synopsis).
+    Queries catalog with a fast 2.5s timeout.
     """
     clean_title = clean_query_for_meta(raw_title)
     cache_key = clean_title.lower()
 
-    if cache_key in _meta_cache:
+    if cache_key in _meta_cache and _meta_cache[cache_key] is not None:
         return _meta_cache[cache_key]
 
     meta = None
     client = get_http_client()
     try:
-        # Enforce 650ms ceiling for metadata lookup
-        meta = await asyncio.wait_for(_lookup_meta(client, clean_title), timeout=0.65)
+        meta = await asyncio.wait_for(_lookup_meta(client, clean_title), timeout=3.5)
     except (asyncio.TimeoutError, Exception) as e:
         logger.debug("Metadata lookup timed out or failed for '%s': %s", clean_title, e)
         meta = None
 
-    # Manage cache size
-    if len(_meta_cache) >= CACHE_MAX_SIZE:
-        _meta_cache.pop(next(iter(_meta_cache)))
+    if meta is not None:
+        if len(_meta_cache) >= CACHE_MAX_SIZE:
+            _meta_cache.pop(next(iter(_meta_cache)))
+        _meta_cache[cache_key] = meta
 
-    _meta_cache[cache_key] = meta
     return meta
+
+
+def _normalize_for_match(text: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (text or "").lower())
 
 
 async def _lookup_meta(client: httpx.AsyncClient, clean_title: str) -> Optional[Dict[str, Any]]:
-    """Execute movie catalog search, falling back to series catalog if no match."""
-    meta = await _search_catalog(client, "movie", clean_title)
-    if not meta:
-        meta = await _search_catalog(client, "series", clean_title)
-    return meta
+    """Execute movie & series catalog search concurrently, choosing the best match."""
+    movie_task = asyncio.create_task(_search_catalog(client, "movie", clean_title))
+    series_task = asyncio.create_task(_search_catalog(client, "series", clean_title))
+    movie_meta, series_meta = await asyncio.gather(movie_task, series_task)
+
+    if series_meta and movie_meta:
+        norm_query = _normalize_for_match(clean_title)
+        s_norm = _normalize_for_match(series_meta.get("title") or "")
+        m_norm = _normalize_for_match(movie_meta.get("title") or "")
+
+        # If series title is an exact match and movie is not, pick series
+        if s_norm == norm_query and m_norm != norm_query:
+            return series_meta
+        # If movie title is an exact match and series is not, pick movie
+        if m_norm == norm_query and s_norm != norm_query:
+            return movie_meta
+        # If series has rating/trailer and movie doesn't, pick series
+        if (series_meta.get("rating") or series_meta.get("trailer_url")) and not (movie_meta.get("rating") or movie_meta.get("trailer_url")):
+            return series_meta
+        return movie_meta
+
+    return movie_meta or series_meta
 
 
 async def _search_catalog(client: httpx.AsyncClient, cat_type: str, title: str) -> Optional[Dict[str, Any]]:
