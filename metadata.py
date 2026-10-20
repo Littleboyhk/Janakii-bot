@@ -220,7 +220,8 @@ def format_netflix_card(
     current_page: int,
     total_pages: int,
     active_filter: str = "ALL",
-    active_season: str = "ALL"
+    active_season: str = "ALL",
+    availability: Optional[Dict[str, Any]] = None
 ) -> str:
     """Format a rich Netflix-style movie info card in Markdown."""
     lines = []
@@ -268,6 +269,28 @@ def format_netflix_card(
 
     item_type = "episode(s)" if (meta and meta.get("is_series")) or (active_season != "ALL") else "file(s)"
     lines.append(f"📊 **{total_count}** {item_type} available{filter_label} • Page {current_page}/{total_pages}")
+
+    # Availability & Missing Status Details
+    if availability and availability.get("is_series"):
+        missing_eps = availability.get("missing_episodes", [])
+        missing_in_q = availability.get("missing_in_active_q", [])
+        alt_q = availability.get("alt_qualities", [])
+        q_map = availability.get("quality_map", {})
+
+        # Show quality distribution if viewing all qualities
+        if q_map and len(q_map) > 1 and active_filter == "ALL":
+            q_parts = [f"`{k}` ({v})" for k, v in sorted(q_map.items())]
+            lines.append(f"📁 **Qualities:** {' • '.join(q_parts)}")
+
+        # If filtered by quality, inform user if missing episodes are present in other qualities
+        if missing_in_q and alt_q:
+            alt_str = ", ".join(alt_q)
+            lines.append(f"💡 *{', '.join(missing_in_q)} missing in {active_filter}, but available in {alt_str}!*")
+
+        # Missing episodes from the season sequence
+        if missing_eps:
+            lines.append(f"⚠️ **Missing Episode(s):** {', '.join(missing_eps)} *(Not in database)*")
+
     lines.append("👇 *Tap a file below to download:*")
 
     return "\n".join(lines)

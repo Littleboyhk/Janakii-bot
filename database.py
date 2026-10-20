@@ -78,8 +78,8 @@ def parse_size_to_bytes(size_str: Optional[str]) -> float:
 
 
 def extract_available_qualities(matches: List[Dict[str, Any]]) -> List[str]:
-    """Scan matches to discover available quality tiers (e.g. ['4K', '2160p', '1080p', '720p', '480p', 'HEVC'])."""
-    qualities_order = ["4K", "2160p", "1080p", "720p", "480p", "HEVC"]
+    """Scan matches to discover available quality tiers (e.g. ['4K', '2160p', '1080p', '720p', '540p', '480p', '360p', 'HEVC'])."""
+    qualities_order = ["4K", "2160p", "1080p", "720p", "540p", "480p", "360p", "HEVC", "HD"]
     found = set()
     for m in matches:
         q_str = (m.get("quality") or "").upper()
@@ -121,6 +121,160 @@ def parse_episode_num(doc: Dict[str, Any]) -> int:
     if m:
         return int(m.group(1))
     return 999
+
+
+def format_ep_range(ep_nums: List[int]) -> List[str]:
+    """Compress episode numbers into clean ranges (e.g. [1,2,3,5,7,8] -> ['E01-E03', 'E05', 'E07-E08'])."""
+    if not ep_nums:
+        return []
+    sorted_nums = sorted(list(set(ep_nums)))
+    ranges = []
+    start = sorted_nums[0]
+    prev = sorted_nums[0]
+
+    for n in sorted_nums[1:]:
+        if n == prev + 1:
+            prev = n
+        else:
+            if start == prev:
+                ranges.append(f"E{start:02d}")
+            else:
+                ranges.append(f"E{start:02d}-E{prev:02d}")
+            start = n
+            prev = n
+    if start == prev:
+        ranges.append(f"E{start:02d}")
+    else:
+        ranges.append(f"E{start:02d}-E{prev:02d}")
+    return ranges
+
+
+def analyze_series_availability(
+    matches: List[Dict[str, Any]],
+    active_season: str = "ALL",
+    active_quality: str = "ALL"
+) -> Dict[str, Any]:
+    """
+    Examines all indexed media records for a series or movie to detect:
+    1. Sequence gaps (missing episodes in season)
+    2. Quality breakdown across available episodes (e.g. 720p: 6 ep, 1080p: 2 ep)
+    3. Episodes available in alternative qualities when active quality is filtered
+    """
+    ep_docs = [m for m in matches if parse_episode_num(m) < 999]
+    if not ep_docs:
+        qualities = extract_available_qualities(matches)
+        return {
+            "is_series": False,
+            "available_qualities": qualities,
+            "missing_episodes": [],
+            "missing_in_active_q": [],
+            "alt_qualities": [],
+            "quality_map": {}
+        }
+
+    # Filter to active season if specified
+    if active_season.upper() != "ALL":
+        target_s = active_season.upper()
+        target_docs = [m for m in ep_docs if extract_season_from_doc(m) == target_s]
+        if not target_docs:
+            target_docs = ep_docs
+    else:
+        target_docs = ep_docs
+
+    all_ep_nums = sorted(list({parse_episode_num(m) for m in target_docs if parse_episode_num(m) < 999}))
+
+    # Check for missing episodes in sequence
+    missing_nums = []
+    if all_ep_nums:
+        min_ep = all_ep_nums[0]
+        max_ep = all_ep_nums[-1]
+
+        # If season starts above E01 (e.g. E21..E23), prefix episodes E01-E20 are missing
+        if min_ep > 1 and min_ep <= 30:
+            missing_nums.extend(range(1, min_ep))
+
+        existing_set = set(all_ep_nums)
+        for i in range(min_ep, max_ep + 1):
+            if i not in existing_set:
+                missing_nums.append(i)
+
+    missing_eps_formatted = format_ep_range(missing_nums)
+
+    # Compute quality coverage
+    quality_map = {}
+    for m in target_docs:
+        q_text = (m.get("quality") or "").upper() + " " + (m.get("title") or "").upper()
+        ep = parse_episode_num(m)
+        for q_tier in ["4K", "2160P", "1080P", "720P", "540P", "480P", "360P", "HEVC", "HD"]:
+            if q_tier in q_text:
+                norm_q = q_tier.lower()
+                if norm_q not in quality_map:
+                    quality_map[norm_q] = set()
+                quality_map[norm_q].add(ep)
+
+    missing_in_active_q = []
+    alt_qualities = []
+    if active_quality.upper() != "ALL":
+        act_q = active_quality.lower()
+        act_eps = quality_map.get(act_q, set())
+        other_eps = set(all_ep_nums) - act_eps
+        if other_eps:
+            missing_in_active_q = format_ep_range(list(other_eps))
+            for q_name, q_eps in quality_map.items():
+                if q_name != act_q and (q_eps & other_eps):
+                    alt_qualities.append(q_name.upper())
+
+    return {
+        "is_series": True,
+        "available_episodes": all_ep_nums,
+        "missing_episodes": missing_eps_formatted,
+        "quality_map": {k.upper(): len(v) for k, v in quality_map.items()},
+        "missing_in_active_q": missing_in_active_q,
+        "alt_qualities": alt_qualities
+    }
+
+
+async def get_series_availability(
+    query: str,
+    season: str = "ALL",
+    quality: str = "ALL"
+) -> Dict[str, Any]:
+    """Fetch search results and run full series & quality availability analysis."""
+    col = get_movies_collection()
+    escaped = re.escape(query.strip())
+    projection = {
+        "_id": 1,
+        "title": 1,
+        "quality": 1,
+        "season_episode": 1
+    }
+    cursor = col.find({"title": {"$regex": escaped, "$options": "i"}}, projection).limit(300)
+    matches = await cursor.to_list(length=300)
+    return analyze_series_availability(matches, season, quality)
+
+
+async def record_user_request(
+    user_id: int,
+    username: str,
+    title: str,
+    details: Optional[str] = None
+) -> Dict[str, Any]:
+    """Record a user request for missing movie, series, season, or quality in MongoDB."""
+    global db
+    if db is None:
+        raise RuntimeError("Database is not initialized.")
+    req_col = db["requests"]
+    doc = {
+        "user_id": user_id,
+        "username": username or f"User_{user_id}",
+        "title": title.strip(),
+        "details": details.strip() if details else "",
+        "created_at": time.time(),
+        "status": "pending"
+    }
+    result = await req_col.insert_one(doc)
+    doc["_id"] = result.inserted_id
+    return doc
 
 
 async def get_season_episodes(

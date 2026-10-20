@@ -59,6 +59,10 @@ chat_messages: Dict[int, set] = {}
 # {token: {"query": str, "season": str, "quality": str}}
 batch_sessions: Dict[str, Dict[str, Any]] = {}
 
+# In-memory cache for content request sessions (e.g. missing episode/quality requests)
+# {token: {"title": str, "season": str, "quality": str, "details": str}}
+request_sessions: Dict[str, Dict[str, Any]] = {}
+
 def track_chat_message(chat_id: int, message_id: int) -> None:
     """Record a message ID to be automatically cleaned up for this chat."""
     if not chat_id or not message_id:
@@ -187,7 +191,8 @@ def build_search_keyboard(
     meta: Optional[Dict[str, Any]] = None,
     query_text: str = "",
     is_group: bool = False,
-    bot_username: Optional[str] = None
+    bot_username: Optional[str] = None,
+    availability: Optional[Dict[str, Any]] = None
 ) -> InlineKeyboardMarkup:
     """
     Construct the inline keyboard displaying movie search results and controls:
@@ -197,6 +202,7 @@ def build_search_keyboard(
     4. Quality filter buttons (All, 4K, 1080p, 720p, etc.)
     5. Movie/Episode result buttons (URL deep-links in groups, callback_data in PM)
     6. Pagination navigation row (<< Prev, Page X/Y, Next >>)
+    7. Request missing episode / quality button
     """
     username = bot_username or BOT_USERNAME
     keyboard = []
@@ -274,13 +280,14 @@ def build_search_keyboard(
     # 5. Movie / Episode Result Buttons (1 per row)
     for movie in results:
         btn_text = database.format_movie_button_text(movie)
+        mid_str = str(movie.get("_id", ""))
         if is_group:
             # Group mode: Deep-link URL button pointing to bot's PM
-            url = f"https://t.me/{username}?start=dl_{str(movie['_id'])}"
+            url = f"https://t.me/{username}?start=dl_{mid_str}"
             keyboard.append([InlineKeyboardButton(text=btn_text, url=url)])
         else:
             # PM mode: Direct callback for instant download in current chat
-            callback_data = f"dl:{str(movie['_id'])}"
+            callback_data = f"dl:{mid_str}"
             keyboard.append([InlineKeyboardButton(text=btn_text, callback_data=callback_data)])
 
     # 6. Pagination Navigation Row
@@ -302,6 +309,32 @@ def build_search_keyboard(
 
     if nav_buttons:
         keyboard.append(nav_buttons)
+
+    # 7. Request Missing Episode or Quality Button
+    if availability and availability.get("is_series"):
+        missing_eps = availability.get("missing_episodes", [])
+        missing_in_q = availability.get("missing_in_active_q", [])
+        if missing_eps or missing_in_q:
+            import secrets
+            req_token = secrets.token_hex(4)
+            missing_items = missing_eps or missing_in_q
+            missing_desc = ", ".join(missing_items)
+            request_sessions[req_token] = {
+                "title": query_text,
+                "season": active_season,
+                "quality": active_filter,
+                "details": f"Missing: {missing_desc} in {active_season} ({active_filter})"
+            }
+            short_desc = missing_desc[:16] + ".." if len(missing_desc) > 16 else missing_desc
+            btn_txt = f"📢 Request Missing ({short_desc})"
+            if is_group:
+                keyboard.append([
+                    InlineKeyboardButton(text=f"{btn_txt} ↗", url=f"https://t.me/{username}?start=req_{req_token}")
+                ])
+            else:
+                keyboard.append([
+                    InlineKeyboardButton(text=btn_txt, callback_data=f"req_item:{req_token}")
+                ])
 
     return InlineKeyboardMarkup(keyboard)
 
@@ -710,6 +743,27 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                     parse_mode=ParseMode.MARKDOWN
                 )
                 return
+        elif arg.startswith("req_"):
+            token = arg[4:]
+            session = request_sessions.get(token)
+            if session:
+                title = session.get("title", "Requested Item")
+                details = session.get("details", "")
+                await process_user_content_request(
+                    chat_id=chat_id,
+                    user=user,
+                    title=title,
+                    details=details,
+                    context=context,
+                    reply_to_mid=update.message.message_id
+                )
+                return
+            else:
+                await update.message.reply_text(
+                    "⚠️ **Request session expired.**\nPlease search again or use `/request <title>` directly.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                return
 
     # If invoked directly in group (without deep link), show friendly intro card
     if is_group:
@@ -828,6 +882,119 @@ async def clean_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         pass
 
 
+async def process_user_content_request(
+    chat_id: int,
+    user,
+    title: str,
+    details: str,
+    context: ContextTypes.DEFAULT_TYPE,
+    reply_to_mid: Optional[int] = None
+) -> None:
+    """Record user request in MongoDB and notify bot administrators."""
+    try:
+        await database.record_user_request(
+            user_id=user.id,
+            username=user.username or user.first_name,
+            title=title,
+            details=details
+        )
+    except Exception as e:
+        logger.error("Error recording user request: %s", e)
+
+    confirm_text = (
+        f"✅ **Request Registered!**\n\n"
+        f"🎬 **Title:** `{title}`\n"
+        f"📝 **Details:** {details or 'Uploaded soon'}\n\n"
+        f"📢 *Our media librarians have been notified. We will index and upload this item to the channel as soon as possible!*"
+    )
+    sent_msg = await context.bot.send_message(
+        chat_id=chat_id,
+        text=confirm_text,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_to_message_id=reply_to_mid
+    )
+    track_chat_message(chat_id, sent_msg.message_id)
+
+    # Dispatch notification to admins
+    if config.ADMIN_USER_IDS:
+        user_mention = f"@{user.username}" if user.username else f"[{user.first_name}](tg://user?id={user.id})"
+        admin_alert = (
+            f"📢 **New User Content Request**\n\n"
+            f"🎬 **Title:** `{title}`\n"
+            f"📝 **Details:** `{details}`\n"
+            f"👤 **Requested by:** {user_mention} (`{user.id}`)\n"
+            f"🕒 **Time:** {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"
+        )
+        for admin_id in config.ADMIN_USER_IDS:
+            try:
+                await context.bot.send_message(
+                    chat_id=admin_id,
+                    text=admin_alert,
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            except Exception as e:
+                logger.warning("Could not alert admin %s: %s", admin_id, e)
+
+
+async def request_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handler for /request <movie or series name> command."""
+    if not update.message or not update.message.text:
+        return
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+    track_chat_message(chat_id, update.message.message_id)
+
+    args_text = " ".join(context.args).strip() if context.args else ""
+    if not args_text:
+        help_msg = await update.message.reply_text(
+            "ℹ️ **How to Request Content:**\n\n"
+            "Use `/request <title> [season/episode/quality]`\n\n"
+            "**Examples:**\n"
+            "• `/request Inception 4K`\n"
+            "• `/request Loki Season 2 1080p`\n"
+            "• `/request Ultimate Spider-Man S01E03`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        track_chat_message(chat_id, help_msg.message_id)
+        return
+
+    await process_user_content_request(
+        chat_id=chat_id,
+        user=user,
+        title=args_text,
+        details="Submitted via /request command",
+        context=context,
+        reply_to_mid=update.message.message_id
+    )
+
+
+async def handle_request_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle clicking on [📢 Request Missing ...] button."""
+    query = update.callback_query
+    await query.answer("Logging your request...")
+    data = query.data or ""
+    token = data.split(":", 1)[1] if ":" in data else ""
+    session = request_sessions.get(token)
+
+    if not session:
+        await query.answer("Request session expired. Please search again or use /request.", show_alert=True)
+        return
+
+    title = session.get("title", "Unknown Title")
+    details = session.get("details", "")
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+
+    await process_user_content_request(
+        chat_id=chat_id,
+        user=user,
+        title=title,
+        details=details,
+        context=context,
+        reply_to_mid=query.message.message_id
+    )
+
+
 async def execute_search(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -918,7 +1085,7 @@ async def execute_search(
             track_chat_message(chat_id, short_msg.message_id)
         return
 
-    # 3. Concurrently Query MongoDB Database & Cinemeta for Netflix Metadata & Poster
+    # 3. Concurrently Query MongoDB Database & Cinemeta for Netflix Metadata & Availability
     meta_task = asyncio.create_task(metadata.fetch_movie_meta(query_text))
     search_task = asyncio.create_task(
         database.search_movies(
@@ -928,20 +1095,46 @@ async def execute_search(
             return_seasons=True
         )
     )
+    avail_task = asyncio.create_task(
+        database.get_series_availability(
+            query=query_text,
+            season="ALL",
+            quality="ALL"
+        )
+    )
 
-    meta, (results, total_count, total_pages, available_qualities, available_seasons) = await asyncio.gather(
+    meta, (results, total_count, total_pages, available_qualities, available_seasons), availability = await asyncio.gather(
         meta_task,
-        search_task
+        search_task,
+        avail_task
     )
 
     if total_count == 0:
         # In groups: only send no-results notice if user explicitly typed a command (/search)
         is_cmd = update.message.text.startswith("/") if update.message and update.message.text else False
         if not is_group or is_cmd:
+            import secrets
+            req_token = secrets.token_hex(4)
+            request_sessions[req_token] = {
+                "title": query_text,
+                "season": "ALL",
+                "quality": "ALL",
+                "details": f"Search yielded 0 results for: {query_text}"
+            }
+            if is_group:
+                req_markup = InlineKeyboardMarkup([[
+                    InlineKeyboardButton(text="📢 Request this Movie / Series ↗", url=f"https://t.me/{BOT_USERNAME}?start=req_{req_token}")
+                ]])
+            else:
+                req_markup = InlineKeyboardMarkup([[
+                    InlineKeyboardButton(text="📢 Request this Movie / Series", callback_data=f"req_item:{req_token}")
+                ]])
+
             no_res_msg = await update.message.reply_text(
                 f"❌ No results found for: **{query_text}**\n\n"
-                "💡 *Tips:* Check the spelling or try searching with just the primary title words.",
-                parse_mode=ParseMode.MARKDOWN
+                "💡 *Tips:* Check the spelling or tap the button below to request this title directly from our channel librarians!",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=req_markup
             )
             track_chat_message(chat_id, no_res_msg.message_id)
             if context.job_queue:
@@ -960,6 +1153,7 @@ async def execute_search(
     context.user_data["last_search_query"] = query_text
     context.user_data["last_search_msg_id"] = update.message.message_id
     context.user_data["last_search_meta"] = meta
+    context.user_data["last_search_availability"] = availability
     context.user_data["available_qualities"] = available_qualities
     context.user_data["active_qfilter"] = "ALL"
     context.user_data["available_seasons"] = available_seasons
@@ -967,6 +1161,7 @@ async def execute_search(
 
     context.chat_data["last_search_query"] = query_text
     context.chat_data["last_search_meta"] = meta
+    context.chat_data["last_search_availability"] = availability
     context.chat_data["available_qualities"] = available_qualities
     context.chat_data["active_qfilter"] = "ALL"
     context.chat_data["available_seasons"] = available_seasons
@@ -985,7 +1180,8 @@ async def execute_search(
         meta=meta,
         query_text=query_text,
         is_group=is_group,
-        bot_username=BOT_USERNAME
+        bot_username=BOT_USERNAME,
+        availability=availability
     )
     card_text = metadata.format_netflix_card(
         meta=meta,
@@ -994,7 +1190,8 @@ async def execute_search(
         current_page=1,
         total_pages=total_pages,
         active_filter="ALL",
-        active_season="ALL"
+        active_season="ALL",
+        availability=availability
     )
 
     # Send rich Markdown text card directly for instant (~0.15s) delivery without remote photo fetch lag
@@ -1153,6 +1350,8 @@ async def handle_pagination_callback(update: Update, context: ContextTypes.DEFAU
 
     is_group = query.message.chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]
     meta = stored.get("meta") or context.chat_data.get("last_search_meta") or context.user_data.get("last_search_meta")
+    availability = await database.get_series_availability(search_query, active_season, active_filter)
+
     reply_markup = build_search_keyboard(
         results=results,
         current_page=target_page,
@@ -1165,7 +1364,8 @@ async def handle_pagination_callback(update: Update, context: ContextTypes.DEFAU
         meta=meta,
         query_text=search_query,
         is_group=is_group,
-        bot_username=BOT_USERNAME
+        bot_username=BOT_USERNAME,
+        availability=availability
     )
     card_text = metadata.format_netflix_card(
         meta=meta,
@@ -1174,7 +1374,8 @@ async def handle_pagination_callback(update: Update, context: ContextTypes.DEFAU
         current_page=target_page,
         total_pages=total_pages if total_pages > 0 else 1,
         active_filter=active_filter,
-        active_season=active_season
+        active_season=active_season,
+        availability=availability
     )
 
     try:
@@ -1238,6 +1439,8 @@ async def handle_quality_filter_callback(update: Update, context: ContextTypes.D
 
     is_group = query.message.chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]
     meta = stored.get("meta") or context.chat_data.get("last_search_meta") or context.user_data.get("last_search_meta")
+    availability = await database.get_series_availability(search_query, active_season, selected_quality)
+
     reply_markup = build_search_keyboard(
         results=results,
         current_page=1,
@@ -1250,7 +1453,8 @@ async def handle_quality_filter_callback(update: Update, context: ContextTypes.D
         meta=meta,
         query_text=search_query,
         is_group=is_group,
-        bot_username=BOT_USERNAME
+        bot_username=BOT_USERNAME,
+        availability=availability
     )
     card_text = metadata.format_netflix_card(
         meta=meta,
@@ -1259,7 +1463,8 @@ async def handle_quality_filter_callback(update: Update, context: ContextTypes.D
         current_page=1,
         total_pages=total_pages if total_pages > 0 else 1,
         active_filter=selected_quality,
-        active_season=active_season
+        active_season=active_season,
+        availability=availability
     )
 
     try:
@@ -1323,6 +1528,8 @@ async def handle_season_filter_callback(update: Update, context: ContextTypes.DE
 
     is_group = query.message.chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]
     meta = stored.get("meta") or context.chat_data.get("last_search_meta") or context.user_data.get("last_search_meta")
+    availability = await database.get_series_availability(search_query, selected_season, active_filter)
+
     reply_markup = build_search_keyboard(
         results=results,
         current_page=1,
@@ -1335,7 +1542,8 @@ async def handle_season_filter_callback(update: Update, context: ContextTypes.DE
         meta=meta,
         query_text=search_query,
         is_group=is_group,
-        bot_username=BOT_USERNAME
+        bot_username=BOT_USERNAME,
+        availability=availability
     )
     card_text = metadata.format_netflix_card(
         meta=meta,
@@ -1344,7 +1552,8 @@ async def handle_season_filter_callback(update: Update, context: ContextTypes.DE
         current_page=1,
         total_pages=total_pages if total_pages > 0 else 1,
         active_filter=active_filter,
-        active_season=selected_season
+        active_season=selected_season,
+        availability=availability
     )
 
     try:
@@ -1586,6 +1795,7 @@ async def post_init(application: Application) -> None:
     commands = [
         BotCommand("start", "Start the bot and search guide"),
         BotCommand("search", "Search for movies or series"),
+        BotCommand("request", "Request a missing movie, series, or quality"),
         BotCommand("clean", "Clear chat history and old searches"),
     ]
     try:
@@ -1677,6 +1887,9 @@ def main() -> None:
         CommandHandler("search", search_command)
     )
     application.add_handler(
+        CommandHandler("request", request_command)
+    )
+    application.add_handler(
         CommandHandler(["clean", "clear"], clean_command, filters=filters.ChatType.PRIVATE)
     )
 
@@ -1687,6 +1900,7 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(handle_quality_filter_callback, pattern=r"^qfilter:.+$"))
     application.add_handler(CallbackQueryHandler(handle_season_filter_callback, pattern=r"^sfilter:.+$"))
     application.add_handler(CallbackQueryHandler(handle_batch_download_callback, pattern=r"^batch_s:.+$"))
+    application.add_handler(CallbackQueryHandler(handle_request_callback, pattern=r"^req_item:.+$"))
     application.add_handler(CallbackQueryHandler(handle_download_callback, pattern=r"^dl:.+$"))
 
     # 3. Diagnostic handler for forwarded messages from channels

@@ -458,9 +458,79 @@ class TestMovieLibrarianBot(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(meta.get("trailer_url"))
         self.assertIsNotNone(meta.get("rating"))
 
+    async def test_14_availability_and_gap_detection(self):
+        """Verify gap detection, missing episodes reporting, and quality alternatives."""
+        matches = [
+            {"title": "Test Show", "season_episode": "S01E01", "quality": "1080p"},
+            {"title": "Test Show", "season_episode": "S01E01", "quality": "720p"},
+            {"title": "Test Show", "season_episode": "S01E02", "quality": "1080p"},
+            {"title": "Test Show", "season_episode": "S01E02", "quality": "720p"},
+            {"title": "Test Show", "season_episode": "S01E04", "quality": "720p"},  # E03 missing entirely, E04 only in 720p
+            {"title": "Test Show", "season_episode": "S01E05", "quality": "540p"},  # 540p quality tag test
+        ]
+        
+        # 1. Broad quality extraction check
+        qualities = database.extract_available_qualities(matches)
+        self.assertIn("1080p", qualities)
+        self.assertIn("720p", qualities)
+        self.assertIn("540p", qualities)
+
+        # 2. General availability analysis
+        avail_all = database.analyze_series_availability(matches, active_season="S01", active_quality="ALL")
+        self.assertTrue(avail_all["is_series"])
+        self.assertEqual(avail_all["available_episodes"], [1, 2, 4, 5])
+        self.assertEqual(avail_all["missing_episodes"], ["E03"])
+        self.assertEqual(avail_all["quality_map"]["1080P"], 2)
+        self.assertEqual(avail_all["quality_map"]["720P"], 3)
+        self.assertEqual(avail_all["quality_map"]["540P"], 1)
+
+        # 3. Quality-filtered analysis (active: 1080p)
+        avail_1080 = database.analyze_series_availability(matches, active_season="S01", active_quality="1080p")
+        self.assertIn("E04", str(avail_1080["missing_in_active_q"]))
+        self.assertIn("720P", avail_1080["alt_qualities"])
+
+        # 4. Verify format_netflix_card renders availability notice
+        card_text = metadata.format_netflix_card(
+            meta={"title": "Test Show", "is_series": True},
+            query="Test Show",
+            total_count=2,
+            current_page=1,
+            total_pages=1,
+            active_filter="1080p",
+            active_season="S01",
+            availability=avail_1080
+        )
+        self.assertIn("Missing Episode(s):** E03", card_text)
+        self.assertIn("available in", card_text)
+
+        # 5. Verify build_search_keyboard renders Request Missing button
+        markup = bot.build_search_keyboard(
+            results=matches[:2],
+            current_page=1,
+            total_pages=1,
+            query_text="Test Show",
+            availability=avail_1080
+        )
+        all_btns = [btn for row in markup.inline_keyboard for btn in row]
+        self.assertTrue(any("Request Missing" in btn.text for btn in all_btns))
+
+    async def test_15_request_system_recording(self):
+        """Verify user content requests are stored into MongoDB."""
+        req = await database.record_user_request(
+            user_id=888999,
+            username="MovieFan",
+            title="Inception",
+            details="Missing 4K HDR REMUX"
+        )
+        self.assertIsNotNone(req.get("_id"))
+        self.assertEqual(req["title"], "Inception")
+        self.assertEqual(req["details"], "Missing 4K HDR REMUX")
+        self.assertEqual(req["status"], "pending")
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
