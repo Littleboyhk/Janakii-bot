@@ -35,13 +35,23 @@ def get_http_client() -> httpx.AsyncClient:
 
 
 def clean_query_for_meta(raw_query: str) -> str:
-    """Strip release tags, years, and file markers for accurate movie lookup."""
+    """Strip release tags, years, brackets, and file markers for accurate movie lookup."""
     text = raw_query.strip()
     # Remove common file extensions
     for ext in [".mkv", ".mp4", ".avi", ".mov", ".webm", ".ts", ".m4v"]:
         if text.lower().endswith(ext):
             text = text[:-len(ext)]
             break
+
+    # If query has brackets e.g. "Lucifer (ലൂസിഫർ)", extract the primary English part if present
+    bracket_match = re.search(r"^([^\(\[\{]+)[\(\[\{]", text)
+    if bracket_match:
+        outside = bracket_match.group(1).strip()
+        if re.search(r"[a-zA-Z0-9]", outside) and len(outside) >= 2:
+            text = outside
+
+    # Remove channel handles e.g. @CC New Lucifer -> Lucifer
+    text = re.sub(r"@\w+", " ", text)
 
     # Remove season/episode tags (e.g. S01E01, Season 1)
     text = re.sub(r"(?i)\b(S\d{1,2}\s?[E|x]\d{1,2}|Season\s?\d{1,2}\s?Episode\s?\d{1,2}|E\d{1,3})\b", "", text)
@@ -62,7 +72,7 @@ def clean_query_for_meta(raw_query: str) -> str:
 async def fetch_movie_meta(raw_title: str) -> Optional[Dict[str, Any]]:
     """
     Query Cinemeta for metadata (posters, ratings, trailers, synopsis).
-    Queries catalog with a fast 2.5s timeout.
+    Queries catalog with a fast 5.0s timeout.
     """
     clean_title = clean_query_for_meta(raw_title)
     cache_key = clean_title.lower()
@@ -73,7 +83,7 @@ async def fetch_movie_meta(raw_title: str) -> Optional[Dict[str, Any]]:
     meta = None
     client = get_http_client()
     try:
-        meta = await asyncio.wait_for(_lookup_meta(client, clean_title), timeout=3.5)
+        meta = await asyncio.wait_for(_lookup_meta(client, clean_title), timeout=5.0)
     except (asyncio.TimeoutError, Exception) as e:
         logger.debug("Metadata lookup timed out or failed for '%s': %s", clean_title, e)
         meta = None
@@ -117,7 +127,8 @@ async def _lookup_meta(client: httpx.AsyncClient, clean_title: str) -> Optional[
 
 async def _search_catalog(client: httpx.AsyncClient, cat_type: str, title: str) -> Optional[Dict[str, Any]]:
     """Query catalog endpoint and fetch details if available within tight deadline."""
-    search_url = f"https://v3-cinemeta.strem.io/catalog/{cat_type}/top/search={title}.json"
+    import urllib.parse
+    search_url = f"https://v3-cinemeta.strem.io/catalog/{cat_type}/top/search={urllib.parse.quote(title)}.json"
     try:
         resp = await client.get(search_url)
         if resp.status_code != 200:

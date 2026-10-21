@@ -1,12 +1,29 @@
 import re
 import time
 import logging
+import urllib.parse
 from typing import Optional, List, Dict, Any, Tuple, Union
 from bson import ObjectId
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase, AsyncIOMotorCollection
+import httpx
 import config
 
 logger = logging.getLogger(__name__)
+
+# Global cache for Indic language translations: {clean_indic_text: english_translation}
+_indic_trans_cache: Dict[str, str] = {}
+# Shared persistent HTTP client for fast async translation lookups
+_trans_http_client: Optional[httpx.AsyncClient] = None
+
+def get_trans_http_client() -> httpx.AsyncClient:
+    global _trans_http_client
+    if _trans_http_client is None or _trans_http_client.is_closed:
+        _trans_http_client = httpx.AsyncClient(
+            timeout=2.5,
+            follow_redirects=True,
+            limits=httpx.Limits(max_keepalive_connections=10, max_connections=20, keepalive_expiry=60.0)
+        )
+    return _trans_http_client
 
 # Global client and db references
 client: Optional[AsyncIOMotorClient] = None
@@ -231,7 +248,302 @@ def analyze_series_availability(
         "quality_map": {k.upper(): len(v) for k, v in quality_map.items()},
         "missing_in_active_q": missing_in_active_q,
         "alt_qualities": alt_qualities
+    }# ==============================================================================
+# Indic Script Helpers, Offline Transliteration, Translation & Query Resolution
+# ==============================================================================
+
+SCRIPT_BASES = [
+    (0x0900, 0x097F, "hi"),  # Devanagari (Hindi, Marathi)
+    (0x0980, 0x09FF, "bn"),  # Bengali
+    (0x0A80, 0x0AFF, "gu"),  # Gujarati
+    (0x0A00, 0x0A7F, "pa"),  # Gurmukhi
+    (0x0B80, 0x0BFF, "ta"),  # Tamil
+    (0x0C00, 0x0C7F, "te"),  # Telugu
+    (0x0C80, 0x0CFF, "kn"),  # Kannada
+    (0x0D00, 0x0D7F, "ml"),  # Malayalam
+]
+
+VOWELS_MAP = {
+    0x05: "a", 0x06: "aa", 0x07: "i", 0x08: "ee", 0x09: "u", 0x0A: "oo",
+    0x0E: "e", 0x0F: "e", 0x10: "ai", 0x12: "o", 0x13: "o", 0x14: "au"
+}
+VOWEL_SIGNS_MAP = {
+    0x3E: "a", 0x3F: "i", 0x40: "ee", 0x41: "u", 0x42: "oo",
+    0x46: "e", 0x47: "e", 0x48: "ai", 0x4A: "o", 0x4B: "o", 0x4C: "au"
+}
+CONSONANTS_MAP = {
+    0x15: "k", 0x16: "kh", 0x17: "g", 0x18: "gh", 0x19: "ng",
+    0x1A: "ch", 0x1B: "chh", 0x1C: "j", 0x1D: "jh", 0x1E: "ny",
+    0x1F: "t", 0x20: "th", 0x21: "d", 0x22: "dh", 0x23: "n",
+    0x24: "t", 0x25: "th", 0x26: "d", 0x27: "dh", 0x28: "n",
+    0x2A: "p", 0x2B: "f", 0x2C: "b", 0x2D: "bh", 0x2E: "m",
+    0x2F: "y", 0x30: "r", 0x31: "rr", 0x32: "l", 0x33: "ll", 0x34: "zh",
+    0x35: "v", 0x36: "sh", 0x37: "sh", 0x38: "s", 0x39: "h"
+}
+CHILLU_MAP = {
+    0x7A: "nn", 0x7B: "n", 0x7C: "r", 0x7D: "l", 0x7E: "ll", 0x7F: "k"
+}
+
+def has_indic_script(text: str) -> bool:
+    """Return True if text contains any Indic Unicode script characters."""
+    for ch in text:
+        code = ord(ch)
+        for b_start, b_end, _ in SCRIPT_BASES:
+            if b_start <= code <= b_end:
+                return True
+    return False
+
+def detect_indic_lang(text: str) -> str:
+    """Detect dominant Indic language code ('ml', 'ta', 'te', 'kn', 'hi', etc.)."""
+    for ch in text:
+        code = ord(ch)
+        for b_start, b_end, lang in SCRIPT_BASES:
+            if b_start <= code <= b_end:
+                return lang
+    return "ml"
+
+def has_latin_script(text: str) -> bool:
+    """Return True if text contains any Latin A-Z letters."""
+    return bool(re.search(r"[a-zA-Z]", text))
+
+def transliterate_indic(word: str) -> str:
+    """Fast, 100% offline rule-based phonetic transliteration from Indic script to Latin."""
+    res = []
+    i = 0
+    n = len(word)
+    while i < n:
+        ch = word[i]
+        code = ord(ch)
+        base = None
+        for b_start, b_end, _ in SCRIPT_BASES:
+            if b_start <= code <= b_end:
+                base = b_start
+                break
+        if base is None:
+            res.append(ch)
+            i += 1
+            continue
+        
+        offset = code - base
+        
+        # Check Malayalam chillu (base == 0x0D00)
+        if base == 0x0D00 and offset in CHILLU_MAP:
+            res.append(CHILLU_MAP[offset])
+            i += 1
+            continue
+            
+        # Independent vowel
+        if offset in VOWELS_MAP:
+            res.append(VOWELS_MAP[offset])
+            i += 1
+            continue
+            
+        # Consonant
+        if offset in CONSONANTS_MAP:
+            cons = CONSONANTS_MAP[offset]
+            if i + 1 < n:
+                next_code = ord(word[i + 1])
+                next_offset = next_code - base
+                if next_offset == 0x4D:  # Virama (halant / suppress inherent vowel)
+                    res.append(cons)
+                    i += 2
+                    continue
+                elif next_offset in VOWEL_SIGNS_MAP:
+                    res.append(cons + VOWEL_SIGNS_MAP[next_offset])
+                    i += 2
+                    continue
+                elif base <= next_code <= base + 0x7F:
+                    res.append(cons + "a")
+                    i += 1
+                    continue
+            res.append(cons)
+            i += 1
+            continue
+            
+        if offset in VOWEL_SIGNS_MAP:
+            res.append(VOWEL_SIGNS_MAP[offset])
+            i += 1
+            continue
+            
+        if offset == 0x4D:  # Standalone virama
+            i += 1
+            continue
+            
+        if offset == 0x02:  # Anusvara (nasal)
+            res.append("m")
+            i += 1
+            continue
+            
+        i += 1
+        
+    return "".join(res).strip()
+
+async def translate_indic_to_en(text: str) -> Optional[str]:
+    """Translate Indic script query (e.g. Malayalam 'ലൂസിഫർ') to English using MyMemory with cache."""
+    clean = text.strip()
+    if not clean or not has_indic_script(clean):
+        return None
+    cache_key = clean.lower()
+    if cache_key in _indic_trans_cache:
+        return _indic_trans_cache[cache_key]
+    
+    lang = detect_indic_lang(clean)
+    try:
+        client = get_trans_http_client()
+        url = f"https://api.mymemory.translated.net/get?q={urllib.parse.quote(clean)}&langpair={lang}|en"
+        r = await client.get(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+        if r.status_code == 200:
+            data = r.json()
+            translated = data.get("responseData", {}).get("translatedText")
+            if translated and not translated.startswith("MYMEMORY WARNING"):
+                translated = translated.strip()
+                if len(translated) >= 2 and not translated.isdigit():
+                    _indic_trans_cache[cache_key] = translated
+                    return translated
+    except Exception as e:
+        logger.debug("Indic translation failed for '%s': %s", clean, e)
+    return None
+
+def generate_query_candidates(raw_query: str) -> List[str]:
+    """
+    Generate prioritized search query candidates:
+    1. Exact query as entered (to find matching local language titles directly in DB)
+    2. Outside brackets: 'Lucifer (ലൂസിഫർ)' -> 'Lucifer'
+    3. Inside brackets: 'ലൂസിഫർ'
+    4. Latin-only part: 'Lucifer ലൂസിഫർ' -> 'Lucifer'
+    5. Title without year: 'Lucifer 2019' -> 'Lucifer'
+    """
+    candidates = []
+    text = raw_query.strip()
+    if not text:
+        return candidates
+    
+    candidates.append(text)
+    
+    bracket_matches = re.findall(r"[\(\[\{]([^\)\]\}]+)[\)\]\}]", text)
+    is_pure_year_bracket = all(b.strip().isdigit() and len(b.strip()) == 4 for b in bracket_matches) if bracket_matches else False
+    
+    if not is_pure_year_bracket:
+        outside = re.sub(r"[\(\[\{][^\)\]\}]+[\)\]\}]", " ", text).strip()
+        outside = re.sub(r"^[\s\-:_.,]+|[\s\-:_.,]+$", "", outside).strip()
+        outside = re.sub(r"\s+", " ", outside).strip()
+        if outside and outside.lower() != text.lower() and len(outside) >= 2:
+            candidates.append(outside)
+            
+        for b in bracket_matches:
+            b_clean = re.sub(r"^[\s\-:_.,]+|[\s\-:_.,]+$", "", b).strip()
+            b_clean = re.sub(r"\s+", " ", b_clean).strip()
+            if b_clean and b_clean.lower() != text.lower() and len(b_clean) >= 2:
+                candidates.append(b_clean)
+            
+    if has_latin_script(text) and has_indic_script(text):
+        latin_only = re.sub(r"[^\x20-\x7E]+", " ", text)
+        latin_only = re.sub(r"[\(\)\[\]\{\}]", " ", latin_only)
+        latin_only = re.sub(r"^[\s\-:_.,]+|[\s\-:_.,]+$", "", latin_only).strip()
+        latin_only = re.sub(r"\s+", " ", latin_only).strip()
+        if latin_only and len(latin_only) >= 2 and latin_only.lower() != text.lower():
+            candidates.append(latin_only)
+            
+        indic_only = "".join(ch for ch in text if ord(ch) > 127).strip()
+        indic_only = re.sub(r"^[\s\-:_.,]+|[\s\-:_.,]+$", "", indic_only).strip()
+        if indic_only and len(indic_only) >= 2 and indic_only.lower() != text.lower():
+            candidates.append(indic_only)
+            
+    if not is_pure_year_bracket:
+        no_year = re.sub(r"\b(19\d\d|20\d\d)\b", " ", text)
+        no_year = re.sub(r"[\(\)\[\]\{\}]", " ", no_year)
+        no_year = re.sub(r"^[\s\-:_.,]+|[\s\-:_.,]+$", "", no_year).strip()
+        no_year = re.sub(r"\s+", " ", no_year).strip()
+        if no_year and no_year.lower() != text.lower() and len(no_year) >= 2:
+            candidates.append(no_year)
+        
+    seen = set()
+    deduped = []
+    for c in candidates:
+        norm = c.lower()
+        if norm and norm not in seen:
+            seen.add(norm)
+            deduped.append(c)
+    return deduped
+
+async def resolve_query_to_matches(
+    query: str,
+    max_pool: int = 150
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """
+    Intelligently resolve search query against MongoDB:
+    1. First tries exact query as-is. If the exact query (including local language text)
+       exists in the database, returns matching records immediately!
+    2. If no matches, evaluates candidate variations (bracket stripped, Latin-only, year-stripped).
+    3. If any candidate contains Indic script, attempts translation & phonetic transliteration to English.
+    4. If still no matches, attempts multi-word token AND query.
+    Returns (resolved_query_string, all_matches_list).
+    """
+    col = get_movies_collection()
+    cleaned = query.strip()
+    if not cleaned:
+        return ("", [])
+        
+    projection = {
+        "_id": 1,
+        "title": 1,
+        "quality": 1,
+        "file_size": 1,
+        "season_episode": 1,
+        "channel_id": 1,
+        "message_id": 1,
+        "file_id": 1,
     }
+    
+    # 1. Try exact query first (matches if exact local language or title is in DB)
+    escaped_raw = re.escape(cleaned)
+    raw_cursor = col.find({"title": {"$regex": escaped_raw, "$options": "i"}}, projection).limit(max_pool)
+    raw_matches = await raw_cursor.to_list(length=max_pool)
+    if raw_matches:
+        raw_matches.sort(key=lambda d: parse_size_to_bytes(d.get("file_size")), reverse=True)
+        return (cleaned, raw_matches)
+        
+    # 2. Generate structured candidates
+    candidates = generate_query_candidates(cleaned)
+    
+    # 3. For any candidate containing Indic script, resolve English translation and transliteration
+    indic_candidates = [c for c in candidates if has_indic_script(c)]
+    for ic in indic_candidates:
+        trans = await translate_indic_to_en(ic)
+        if trans and trans.lower() not in [x.lower() for x in candidates]:
+            candidates.append(trans)
+        tl = transliterate_indic(ic)
+        if tl and len(tl) >= 3 and tl.lower() not in [x.lower() for x in candidates]:
+            candidates.append(tl)
+            
+    # 4. Search candidates in order (excluding candidate[0] which was checked in step 1)
+    for cand in candidates[1:]:
+        cand_clean = cand.strip()
+        if not cand_clean or len(cand_clean) < 2:
+            continue
+        cand_escaped = re.escape(cand_clean)
+        cand_cursor = col.find({"title": {"$regex": cand_escaped, "$options": "i"}}, projection).limit(max_pool)
+        matches = await cand_cursor.to_list(length=max_pool)
+        if matches:
+            matches.sort(key=lambda d: parse_size_to_bytes(d.get("file_size")), reverse=True)
+            return (cand_clean, matches)
+            
+    # 5. Multi-word AND matching (e.g. "Lucifer Malayalam" -> matches files containing both Lucifer and Malayalam)
+    words = [w for w in re.split(r"[\s._\-:;,\(\)\[\]\{\}]+", cleaned) if len(w) >= 2]
+    if len(words) > 1:
+        and_filter = {"$and": [{"title": {"$regex": re.escape(w), "$options": "i"}} for w in words]}
+        token_cursor = col.find(and_filter, projection).limit(max_pool)
+        token_matches = await token_cursor.to_list(length=max_pool)
+        if token_matches:
+            token_matches.sort(key=lambda d: parse_size_to_bytes(d.get("file_size")), reverse=True)
+            return (" ".join(words), token_matches)
+            
+    return (cleaned, [])
+
+async def resolve_search_query(query: str) -> str:
+    """Resolve a raw query to its matching database title (or cleaned query if not found)."""
+    resolved_title, _ = await resolve_query_to_matches(query, max_pool=1)
+    return resolved_title
 
 
 async def get_series_availability(
@@ -241,7 +553,8 @@ async def get_series_availability(
 ) -> Dict[str, Any]:
     """Fetch search results and run full series & quality availability analysis."""
     col = get_movies_collection()
-    escaped = re.escape(query.strip())
+    cleaned = query.strip()
+    escaped = re.escape(cleaned)
     projection = {
         "_id": 1,
         "title": 1,
@@ -250,6 +563,8 @@ async def get_series_availability(
     }
     cursor = col.find({"title": {"$regex": escaped, "$options": "i"}}, projection).limit(300)
     matches = await cursor.to_list(length=300)
+    if not matches:
+        _, matches = await resolve_query_to_matches(cleaned, max_pool=300)
     return analyze_series_availability(matches, season, quality)
 
 
@@ -284,7 +599,8 @@ async def get_season_episodes(
 ) -> List[Dict[str, Any]]:
     """Retrieve all episodes belonging to a specific season, sorted in natural episode order."""
     col = get_movies_collection()
-    escaped = re.escape(query.strip())
+    cleaned = query.strip()
+    escaped = re.escape(cleaned)
     filter_query = {
         "title": {
             "$regex": escaped,
@@ -303,6 +619,9 @@ async def get_season_episodes(
     }
     cursor = col.find(filter_query, projection).limit(250)
     matches = await cursor.to_list(length=250)
+    if not matches:
+        _, matches = await resolve_query_to_matches(cleaned, max_pool=250)
+
     target_s = season.upper()
     season_matches = [m for m in matches if extract_season_from_doc(m) == target_s]
 
@@ -324,16 +643,22 @@ async def search_movies(
     quality_filter: Optional[str] = None,
     season_filter: Optional[str] = None,
     return_qualities: bool = False,
-    return_seasons: bool = False
+    return_seasons: bool = False,
+    return_resolved_query: bool = False
 ) -> Any:
     """
     Search for movies matching title using case-insensitive regex.
-    Results are sorted in descending order of file size (highest GB first).
+    Supports candidate resolution for bracketed text, Indic script transliteration/translation,
+    and token matching. Results are sorted in descending order of file size (highest GB first).
     Supports optional filtering by quality tag and season tag.
     """
     col = get_movies_collection()
     cleaned_query = query.strip()
     if not cleaned_query:
+        if return_resolved_query:
+            if return_seasons:
+                return ([], 0, 0, [], [], "")
+            return ([], 0, 0, [], "") if return_qualities else ([], 0, 0, "")
         if return_seasons:
             return ([], 0, 0, [], [])
         return ([], 0, 0, []) if return_qualities else ([], 0, 0)
@@ -341,6 +666,7 @@ async def search_movies(
     cache_key = cleaned_query.lower()
     now = time.time()
     all_matches = None
+    resolved_query = cleaned_query
 
     # Check hot cache first (0.0001s lookup)
     if cache_key in _db_search_cache:
@@ -349,42 +675,24 @@ async def search_movies(
             all_matches = list(cached_matches)
 
     if all_matches is None:
-        # Escaped regex pattern for safe fuzzy search
-        escaped = re.escape(cleaned_query)
-        filter_query = {
-            "title": {
-                "$regex": escaped,
-                "$options": "i"
-            }
-        }
-
-        # Fetch matching results up to pool limit with field projection for minimal network payload
         MAX_SEARCH_POOL = 150
-        projection = {
-            "_id": 1,
-            "title": 1,
-            "quality": 1,
-            "file_size": 1,
-            "season_episode": 1,
-            "channel_id": 1,
-            "message_id": 1,
-            "file_id": 1,
-        }
-        cursor = col.find(filter_query, projection).limit(MAX_SEARCH_POOL)
-        all_matches = await cursor.to_list(length=MAX_SEARCH_POOL)
+        resolved_query, all_matches = await resolve_query_to_matches(cleaned_query, max_pool=MAX_SEARCH_POOL)
 
         if not all_matches:
+            if return_resolved_query:
+                if return_seasons:
+                    return ([], 0, 0, [], [], cleaned_query)
+                return ([], 0, 0, [], cleaned_query) if return_qualities else ([], 0, 0, cleaned_query)
             if return_seasons:
                 return ([], 0, 0, [], [])
             return ([], 0, 0, []) if return_qualities else ([], 0, 0)
 
-        # Sort so that highest GB files appear first
-        all_matches.sort(key=lambda d: parse_size_to_bytes(d.get("file_size")), reverse=True)
-
-        # Update cache
+        # Update cache for both the input query and the resolved query
         if len(_db_search_cache) >= SEARCH_CACHE_MAX:
             _db_search_cache.pop(next(iter(_db_search_cache)))
         _db_search_cache[cache_key] = (now, list(all_matches))
+        if resolved_query.lower() != cache_key:
+            _db_search_cache[resolved_query.lower()] = (now, list(all_matches))
 
     available_qualities = extract_available_qualities(all_matches)
     available_seasons = extract_available_seasons(all_matches)
@@ -408,6 +716,10 @@ async def search_movies(
 
     total_count = len(filtered_matches)
     if total_count == 0:
+        if return_resolved_query:
+            if return_seasons:
+                return ([], 0, 0, available_qualities, available_seasons, resolved_query)
+            return ([], 0, 0, available_qualities, resolved_query) if return_qualities else ([], 0, 0, resolved_query)
         if return_seasons:
             return ([], 0, 0, available_qualities, available_seasons)
         return ([], 0, 0, available_qualities) if return_qualities else ([], 0, 0)
@@ -417,6 +729,13 @@ async def search_movies(
 
     skip = (page - 1) * page_size
     results = filtered_matches[skip : skip + page_size]
+
+    if return_resolved_query:
+        if return_seasons:
+            return results, total_count, total_pages, available_qualities, available_seasons, resolved_query
+        if return_qualities:
+            return results, total_count, total_pages, available_qualities, resolved_query
+        return results, total_count, total_pages, resolved_query
 
     if return_seasons:
         return results, total_count, total_pages, available_qualities, available_seasons

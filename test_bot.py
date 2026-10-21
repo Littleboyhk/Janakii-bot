@@ -19,6 +19,7 @@ import database
 import bot
 import config
 import metadata
+from telegram.constants import ChatType
 
 
 class TestMovieLibrarianBot(unittest.IsolatedAsyncioTestCase):
@@ -526,6 +527,136 @@ class TestMovieLibrarianBot(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(req["title"], "Inception")
         self.assertEqual(req["details"], "Missing 4K HDR REMUX")
         self.assertEqual(req["status"], "pending")
+
+    async def test_16_bracket_and_multilingual_search(self):
+        """Verify searching 'Lucifer (ലൂസിഫർ)' resolves to 'Lucifer' and finds matching records."""
+        await database.insert_movie(
+            title="@C V Lucifer Malayalam Proper HDRip",
+            file_id="lucifer_file_1",
+            quality="1080p",
+            file_size="2.8 GB"
+        )
+        results, count, pages, resolved = await database.search_movies(
+            query="Lucifer (ലൂസിഫർ)",
+            return_resolved_query=True
+        )
+        self.assertEqual(count, 1)
+        self.assertEqual(len(results), 1)
+        self.assertIn("Lucifer", results[0]["title"])
+        self.assertEqual(resolved, "Lucifer")
+
+    async def test_17_local_language_direct_db_match(self):
+        """Verify that when a local language title exists directly in DB, it is found and returned."""
+        await database.insert_movie(
+            title="ദൃശ്യം 2 (2021) Proper Malayalam HDRip",
+            file_id="drishyam_file_1",
+            quality="1080p",
+            file_size="1.9 GB"
+        )
+        results, count, pages = await database.search_movies(query="ദൃശ്യം")
+        self.assertEqual(count, 1)
+        self.assertIn("ദൃശ്യം", results[0]["title"])
+
+    async def test_18_local_language_translation_resolution(self):
+        """Verify that searching local language text ('ലൂസിഫർ') resolves to English ('Lucifer') when English title is in DB."""
+        await database.insert_movie(
+            title="@CC New Lucifer 2019 Tamil",
+            file_id="lucifer_file_2",
+            quality="720p",
+            file_size="1.2 GB"
+        )
+        results, count, pages, resolved = await database.search_movies(
+            query="ലൂസിഫർ",
+            return_resolved_query=True
+        )
+        self.assertEqual(count, 1)
+        self.assertEqual(resolved, "Lucifer")
+        self.assertIn("Lucifer", results[0]["title"])
+
+    async def test_19_not_found_google_advice_pm(self):
+        """Verify that wrong movie names reply with 'Not found' and advise searching on Google with a Google search button."""
+        update = MagicMock()
+        update.effective_user.id = 12345
+        update.effective_chat.id = 12345
+        update.effective_chat.type = ChatType.PRIVATE
+        update.message.message_id = 100
+        update.message.text = "NonexistentMovieName9999"
+
+        # Mock reply_text
+        reply_mock = AsyncMock()
+        sent_msg_mock = MagicMock()
+        sent_msg_mock.message_id = 101
+        reply_mock.return_value = sent_msg_mock
+        update.message.reply_text = reply_mock
+
+        context = MagicMock()
+        context.bot = AsyncMock()
+        context.user_data = {}
+        context.chat_data = {}
+        context.job_queue = MagicMock()
+
+        # Mock is_user_subscribed to True
+        with patch("bot.is_user_subscribed", AsyncMock(return_value=(True, ""))):
+            await bot.execute_search(update, context, "NonexistentMovieName9999")
+
+        # Verify reply was called
+        reply_mock.assert_called_once()
+        sent_args, sent_kwargs = reply_mock.call_args
+        msg_text = sent_args[0] if sent_args else sent_kwargs.get("text", "")
+
+        # Verify message says not found and mentions Google search and exact spelling
+        self.assertIn("Not Found", msg_text)
+        self.assertIn("search on Google", msg_text)
+        self.assertIn("spell the exact movie or series name correctly", msg_text)
+
+        # Verify inline keyboard has Google search button
+        reply_markup = sent_kwargs.get("reply_markup")
+        self.assertIsNotNone(reply_markup)
+        all_buttons = [btn for row in reply_markup.inline_keyboard for btn in row]
+        google_btn = next((btn for btn in all_buttons if "Google" in btn.text), None)
+        self.assertIsNotNone(google_btn)
+        self.assertIn("google.com/search", google_btn.url)
+
+    async def test_20_not_found_groups_filter_and_search(self):
+        """Verify conversational words in groups are ignored, while wrong movie names in groups receive Google advice."""
+        # Case A: Conversational greeting in group (e.g. "hi") -> should be ignored
+        update_hi = MagicMock()
+        update_hi.effective_user.id = 555
+        update_hi.effective_chat.id = -100999
+        update_hi.effective_chat.type = ChatType.SUPERGROUP
+        update_hi.message.message_id = 200
+        update_hi.message.text = "hi"
+        reply_hi_mock = AsyncMock()
+        update_hi.message.reply_text = reply_hi_mock
+
+        context = MagicMock()
+        context.bot = AsyncMock()
+        context.user_data = {}
+        context.chat_data = {}
+        context.job_queue = MagicMock()
+
+        await bot.execute_search(update_hi, context, "hi")
+        reply_hi_mock.assert_not_called()
+
+        # Case B: Real search query in group that is not found -> should reply with Google advice
+        update_movie = MagicMock()
+        update_movie.effective_user.id = 556
+        update_movie.effective_chat.id = -100999
+        update_movie.effective_chat.type = ChatType.SUPERGROUP
+        update_movie.message.message_id = 201
+        update_movie.message.text = "FictionalMovie999"
+        reply_movie_mock = AsyncMock()
+        sent_group_msg = MagicMock()
+        sent_group_msg.message_id = 202
+        reply_movie_mock.return_value = sent_group_msg
+        update_movie.message.reply_text = reply_movie_mock
+
+        await bot.execute_search(update_movie, context, "FictionalMovie999")
+        reply_movie_mock.assert_called_once()
+        args, kwargs = reply_movie_mock.call_args
+        group_msg_text = args[0] if args else kwargs.get("text", "")
+        self.assertIn("Not Found", group_msg_text)
+        self.assertIn("search on Google", group_msg_text)
 
 
 if __name__ == "__main__":

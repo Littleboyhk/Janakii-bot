@@ -770,8 +770,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         welcome_group_msg = await update.message.reply_text(
             f"👋 Hello **{user.first_name}**!\n\n"
             "🎬 **Janakii Media Librarian is Active in this Group!**\n\n"
-            "🔍 To find movies or series, simply type the title in chat or use:\n"
-            "`/search <movie or series name>`\n\n"
+            "🔍 To find movies or series, simply type the title directly in this chat!\n"
+            "*(e.g., `Jailer`, `Inception`, `Breaking Bad`)*\n\n"
             "🍿 **New Features:**\n"
             "• 🍿 YouTube Trailer streaming previews\n"
             "• ⭐ IMDb ratings, runtime & cast details\n"
@@ -1085,72 +1085,83 @@ async def execute_search(
             track_chat_message(chat_id, short_msg.message_id)
         return
 
-    # 3. Concurrently Query MongoDB Database & Cinemeta for Netflix Metadata & Availability
-    meta_task = asyncio.create_task(metadata.fetch_movie_meta(query_text))
-    search_task = asyncio.create_task(
-        database.search_movies(
-            query=query_text,
-            page=1,
-            page_size=config.RESULTS_PER_PAGE,
-            return_seasons=True
-        )
+    # 3. Query MongoDB Database with intelligent candidate resolution (bracket stripping, Indic transliteration & translation)
+    results, total_count, total_pages, available_qualities, available_seasons, resolved_query = await database.search_movies(
+        query=query_text,
+        page=1,
+        page_size=config.RESULTS_PER_PAGE,
+        return_seasons=True,
+        return_resolved_query=True
     )
+
+    if total_count == 0:
+        # Avoid replying to trivial chat messages in groups (e.g. "hi", "ok", "thanks")
+        CONVERSATIONAL_WORDS = {
+            "hi", "hello", "hey", "hlo", "ok", "okay", "thanks", "thank you",
+            "thx", "good morning", "good night", "gm", "gn", "bye", "admin", "yes", "no"
+        }
+        is_cmd = update.message.text.startswith("/") if update.message and update.message.text else False
+        if is_group and not is_cmd and query_text.lower().strip() in CONVERSATIONAL_WORDS:
+            return
+
+        import secrets
+        import urllib.parse
+        req_token = secrets.token_hex(4)
+        request_sessions[req_token] = {
+            "title": query_text,
+            "season": "ALL",
+            "quality": "ALL",
+            "details": f"Search yielded 0 results for: {query_text}"
+        }
+
+        google_search_url = f"https://www.google.com/search?q={urllib.parse.quote(query_text + ' movie')}"
+        buttons = [
+            [InlineKeyboardButton(text="🔍 Search on Google", url=google_search_url)]
+        ]
+        if is_group:
+            buttons.append([
+                InlineKeyboardButton(text="📢 Request this Movie / Series ↗", url=f"https://t.me/{BOT_USERNAME}?start=req_{req_token}")
+            ])
+        else:
+            buttons.append([
+                InlineKeyboardButton(text="📢 Request this Movie / Series", callback_data=f"req_item:{req_token}")
+            ])
+        req_markup = InlineKeyboardMarkup(buttons)
+
+        no_res_msg = await update.message.reply_text(
+            f"❌ **Movie / Series Not Found!**\n\n"
+            f"We couldn't find any results for: **{query_text}**\n\n"
+            "🔍 **Please search on Google and spell the exact movie or series name correctly.**\n\n"
+            "💡 *Tip: Check the exact English spelling on Google and send the name again, or tap the button below to request this title!*",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=req_markup
+        )
+        track_chat_message(chat_id, no_res_msg.message_id)
+        if context.job_queue:
+            context.job_queue.run_once(
+                auto_delete_job,
+                when=20 if is_group else 30,
+                data={
+                    "chat_id": chat_id,
+                    "message_ids": [update.message.message_id, no_res_msg.message_id],
+                    "clean_all": False
+                }
+            )
+        return
+
+    # Total count > 0! Concurrently fetch Cinemeta metadata & series availability using resolved_query
+    meta_task = asyncio.create_task(metadata.fetch_movie_meta(resolved_query))
     avail_task = asyncio.create_task(
         database.get_series_availability(
-            query=query_text,
+            query=resolved_query,
             season="ALL",
             quality="ALL"
         )
     )
-
-    meta, (results, total_count, total_pages, available_qualities, available_seasons), availability = await asyncio.gather(
-        meta_task,
-        search_task,
-        avail_task
-    )
-
-    if total_count == 0:
-        # In groups: only send no-results notice if user explicitly typed a command (/search)
-        is_cmd = update.message.text.startswith("/") if update.message and update.message.text else False
-        if not is_group or is_cmd:
-            import secrets
-            req_token = secrets.token_hex(4)
-            request_sessions[req_token] = {
-                "title": query_text,
-                "season": "ALL",
-                "quality": "ALL",
-                "details": f"Search yielded 0 results for: {query_text}"
-            }
-            if is_group:
-                req_markup = InlineKeyboardMarkup([[
-                    InlineKeyboardButton(text="📢 Request this Movie / Series ↗", url=f"https://t.me/{BOT_USERNAME}?start=req_{req_token}")
-                ]])
-            else:
-                req_markup = InlineKeyboardMarkup([[
-                    InlineKeyboardButton(text="📢 Request this Movie / Series", callback_data=f"req_item:{req_token}")
-                ]])
-
-            no_res_msg = await update.message.reply_text(
-                f"❌ No results found for: **{query_text}**\n\n"
-                "💡 *Tips:* Check the spelling or tap the button below to request this title directly from our channel librarians!",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=req_markup
-            )
-            track_chat_message(chat_id, no_res_msg.message_id)
-            if context.job_queue:
-                context.job_queue.run_once(
-                    auto_delete_job,
-                    when=20 if is_group else 30,
-                    data={
-                        "chat_id": chat_id,
-                        "message_ids": [update.message.message_id, no_res_msg.message_id],
-                        "clean_all": False
-                    }
-                )
-        return
+    meta, availability = await asyncio.gather(meta_task, avail_task)
 
     # 4. Cache search state in user session and chat session
-    context.user_data["last_search_query"] = query_text
+    context.user_data["last_search_query"] = resolved_query
     context.user_data["last_search_msg_id"] = update.message.message_id
     context.user_data["last_search_meta"] = meta
     context.user_data["last_search_availability"] = availability
@@ -1159,7 +1170,7 @@ async def execute_search(
     context.user_data["available_seasons"] = available_seasons
     context.user_data["active_sfilter"] = "ALL"
 
-    context.chat_data["last_search_query"] = query_text
+    context.chat_data["last_search_query"] = resolved_query
     context.chat_data["last_search_meta"] = meta
     context.chat_data["last_search_availability"] = availability
     context.chat_data["available_qualities"] = available_qualities
@@ -1178,14 +1189,14 @@ async def execute_search(
         active_season="ALL",
         total_count=total_count,
         meta=meta,
-        query_text=query_text,
+        query_text=resolved_query,
         is_group=is_group,
         bot_username=BOT_USERNAME,
         availability=availability
     )
     card_text = metadata.format_netflix_card(
         meta=meta,
-        query=query_text,
+        query=resolved_query,
         total_count=total_count,
         current_page=1,
         total_pages=total_pages,
@@ -1206,7 +1217,7 @@ async def execute_search(
 
     # Store search state for this specific card
     context.chat_data[f"search_{sent_results_msg.message_id}"] = {
-        "query": query_text,
+        "query": resolved_query,
         "meta": meta,
         "qualities": available_qualities,
         "active_filter": "ALL",
@@ -1794,7 +1805,6 @@ async def post_init(application: Application) -> None:
 
     commands = [
         BotCommand("start", "Start the bot and search guide"),
-        BotCommand("search", "Search for movies or series"),
         BotCommand("request", "Request a missing movie, series, or quality"),
         BotCommand("clean", "Clear chat history and old searches"),
     ]
